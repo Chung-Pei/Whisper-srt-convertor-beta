@@ -1,0 +1,45 @@
+name: Tests
+
+# r9：PR 時自動跑離線功能測試（functional）；deploy.yml 也會先呼叫這裡，測試沒過就不部署。
+on:
+  pull_request:
+  workflow_call:   # 推送到 main 時由 deploy.yml 呼叫（測試沒過就不部署），不另外重複跑
+
+permissions:
+  contents: read
+
+jobs:
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取得原始碼
+        uses: actions/checkout@v6
+
+      - name: 設定 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安裝相依套件（依 package-lock.json）
+        run: npm ci
+
+      - name: 安裝 Playwright 瀏覽器
+        run: npx playwright install --with-deps chromium
+
+      - name: 一致性檢查與建置
+        run: |
+          node scripts/check-consistency.mjs
+          node scripts/build.mjs
+
+      - name: 功能測試（離線，替身模型）
+        run: npx playwright test --project=functional --reporter=line
+
+      - name: 失敗時上傳測試紀錄
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: test-results/
+          retention-days: 7

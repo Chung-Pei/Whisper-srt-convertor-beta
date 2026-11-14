@@ -1,6 +1,5 @@
 # 依賴與測試工具（執行 tests/preview-panel.spec.ts 時本機安裝）
 node_modules/
-package-lock.json
 
 # Playwright
 test-results/
