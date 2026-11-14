@@ -107,6 +107,8 @@ fs.writeFileSync(path.join(DIST, 'sw.js'), distSwJs, 'utf8');
 fs.cpSync(path.join(ROOT, 'manifest.json'), path.join(DIST, 'manifest.json'));
 fs.cpSync(path.join(ROOT, 'icons'), path.join(DIST, 'icons'), { recursive: true });
 fs.cpSync(path.join(ROOT, 'fonts'), path.join(DIST, 'fonts'), { recursive: true });
+// r9 覆核 N8：字型為 SIL OFL 1.1 授權，授權檔必須跟字型一起發佈
+if (!fs.existsSync(path.join(DIST, 'fonts', 'OFL.txt'))) { console.error('[build] 缺少 fonts/OFL.txt（字型授權檔）'); process.exit(1); }
 
 // ── 10. 印出這次的 CACHE_VERSION 與 3 個 hash 值 ───────────────────────────────
 console.log(`[build] CACHE_VERSION = ${CACHE_VERSION}`);
