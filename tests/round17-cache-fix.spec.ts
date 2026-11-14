@@ -148,7 +148,7 @@ test('CF-02 模型資料夾：Range 請求不寫檔、有本機檔時回 206；�
 });
 
 // ── 主執行緒：損壞 ≠ GPU 失敗 ──────────────────────────────────────────
-async function corruptLoad(page: Page, errMsg: string, fails: number) {
+async function corruptLoad(page: Page, errMsg: string, fails: number, withFolder = false) {
   const stubLib = `
     try { Object.defineProperty(WorkerNavigator.prototype, 'gpu', { get: () => ({ requestAdapter: async () => ({}) }), configurable: true }); } catch (_) {}
     export const env = {};
@@ -175,7 +175,14 @@ async function corruptLoad(page: Page, errMsg: string, fails: number) {
   });
   for (const re of TJS_RE) await page.route(re, (r) => r.fulfill({ contentType: 'application/javascript', body: stubLib }));
   await page.route('**/opencc-js@*/dist/umd/cn2t.js', (r) => r.fulfill({ contentType: 'application/javascript', body: 'window.OpenCC = { Converter: () => (t) => t };' }));
+  if (withFolder) await page.addInitScript(() => {
+    (window as any).showDirectoryPicker = async () => (await navigator.storage.getDirectory()).getDirectoryHandle('我的模型', { create: true });
+  });
   await recognize(page);
+  if (withFolder) {
+    await page.evaluate(() => (document.getElementById('btnPickModelFolder') as HTMLElement).click());
+    await expect(page.locator('#logBox')).toContainText('模型資料夾已設定為：我的模型');
+  }
   // 快取裡放一個此模型的檔案：損壞時 Worker 應清掉它（下次重新下載）
   await page.evaluate(async () => { const c = await caches.open('transformers-cache'); await c.put('https://huggingface.co/Xenova/whisper-base/resolve/main/config.json', new Response('{"a":1}')); });
   await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization']);
@@ -209,4 +216,26 @@ test('CF-04 清除並重新下載後仍損壞 → 白話錯誤訊息，不顯示
   expect(r.log).toContain('模型檔案無法正確讀取');
   expect(r.log).toContain('重新整理頁面再試');
   expect(r.log).not.toContain('顯示卡加速無法使用');
+});
+
+test('CF-04b 最終錯誤：畫面訊息不夾技術細節（只寫在紀錄的「供回報問題用」）', async ({ page }) => {
+  test.setTimeout(120_000);
+  const r = await corruptLoad(page, "Expected property name or '}' in JSON at position 1 (line 1 column 2)", 2);
+  expect(r.log).toContain('模型檔案無法正確讀取');
+  expect(r.log).not.toContain('（技術細節：');
+  expect(r.log).toContain('技術細節，供回報問題用');
+});
+
+test('CF-05 protobuf parsing failed（大模型可能是記憶體／2 GB 上限）→ 不當成檔案損壞、不清掉已下載的模型', async ({ page }) => {
+  test.setTimeout(120_000);
+  const r = await corruptLoad(page, 'Load model from blob failed: protobuf parsing failed.', 1);
+  expect(r.log).not.toContain('已自動清除，正在重新下載');
+  expect(r.cacheLeft).toBe(1);
+});
+
+test('CF-06 有選模型資料夾時，最終錯誤提示刪除資料夾內該模型的子資料夾', async ({ page }) => {
+  test.setTimeout(120_000);
+  const r = await corruptLoad(page, "Expected property name or '}' in JSON at position 1 (line 1 column 2)", 2, true);
+  expect(r.log).toContain('模型檔案無法正確讀取');
+  expect(r.log).toContain('刪除這個模型的子資料夾');
 });

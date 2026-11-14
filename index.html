@@ -1967,7 +1967,8 @@ let _folderBypass = false;   // r9-fix：上次載入發現檔案損壞 → 本�
 // (2) 下載中斷時資料夾留下 0 位元組空檔，再被存進瀏覽器快取；Cache Storage 對空內容回傳 body=null → readResponse 的 getReader 崩潰。
 // 修法：攔截器不寫入 Range／非 GET；讀取時檢查空檔與 JSON；瀏覽器快取外包一層檢查（損壞自動刪除、不存入壞資料）；
 //      仍失敗時 Worker 回報 MODEL_FILE_CORRUPT（不再當成 GPU 失敗），主執行緒清除後重新下載一次。
-const MODEL_FILE_CORRUPT_RE = /in JSON at position|Unexpected (token|end of JSON)|is not valid JSON|JSON\\.parse|getReader|reading 'body'|Unable to get model file|protobuf parsing failed/i;
+const MODEL_FILE_CORRUPT_RE = /in JSON at position|Unexpected (token|end of JSON)|is not valid JSON|JSON\\.parse|getReader|reading 'body'|Unable to get model file/i;
+// 覆核 r1-S1：protobuf parsing failed 不列入（大模型可能是 2 GB 上限或記憶體不足，不是損壞；不應清掉數 GB 重下）。
 const MODEL_CACHE_NAME = 'transformers-cache';
 function _isJsonName(p) { return /\\.json(\\?|$)/i.test(String(p)); }
 function _shortName(u) { try { return decodeURIComponent(String(u).split('?')[0].split('/').pop()); } catch (_) { return String(u); } }
@@ -2606,6 +2607,12 @@ const GPU_LOAD_FAILED = 'GPU_LOAD_FAILED: ';
 const MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT: ';
 const MODEL_CORRUPT_USER_MSG = '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
   + '請確認網路穩定後重新整理頁面再試；若仍失敗，可先改選其他模型，或在瀏覽器設定中清除本網站的資料後再試。';
+/** 覆核 r1-S3：有選「模型資料夾」時，清除網站資料不會刪到資料夾裡的檔案 → 改提示刪除資料夾內該模型的子資料夾。 */
+function modelCorruptUserMsg() {
+  if (!modelFolderHandle) return MODEL_CORRUPT_USER_MSG;
+  return '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
+    + `請確認網路穩定後重新整理頁面再試；若仍失敗，請打開你選的模型資料夾「${modelFolderHandle.name}」，刪除這個模型的子資料夾後再試，或先取消模型資料夾、改選其他模型。`;
+}
 /** 送 LOAD_MODEL 並等 MODEL_READY；回傳實際載入模型的 Worker。
  *  v24 r8：WebGPU 建 session 失敗（Worker 回 GPU_LOAD_FAILED）→ 記下該模型不再用 GPU、終止這個 Worker
  *  （唯一能真正釋放 WASM heap 與 GPU buffer 的方法）、建新 Worker 以 WASM 重載。onMsg 會跟著搬到新 Worker。
@@ -2619,7 +2626,10 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
     } catch (err) {
       const m = String(err?.message ?? err);
       if (m.startsWith(MODEL_FILE_CORRUPT)) {
-        if (repaired) throw new Error(`${MODEL_CORRUPT_USER_MSG}（技術細節：${m.slice(MODEL_FILE_CORRUPT.length)}）`);
+        if (repaired) {
+          log(`（技術細節，供回報問題用：${m.slice(MODEL_FILE_CORRUPT.length)}）`, 'info');
+          throw new Error(modelCorruptUserMsg());
+        }
         repaired = true;
         log('⚠ 電腦裡暫存的模型檔有損壞（可能是之前下載中斷），已自動清除，正在重新下載…', 'warn');
         log(`（技術細節，供回報問題用：${m.slice(MODEL_FILE_CORRUPT.length)}）`, 'info');
@@ -2635,7 +2645,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
       if (onMsg) w.addEventListener('message', onMsg);
     }
   }
-  throw new Error(MODEL_CORRUPT_USER_MSG);
+  throw new Error(modelCorruptUserMsg());
 }
 
 /** 失敗後重建 Worker 並重載模型。oom／crash：WebGPU 後端 → 改用 WASM（Worker 對 WebGPU 固定用 enc:fp16/dec:q4 或 fp32，忽略 dtype）；
