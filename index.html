@@ -1758,6 +1758,8 @@
       <div class="prog-fill indeterminate" id="progFill"></div>
     </div>
     <div class="prog-eta" id="progEta"></div>
+    <!-- r9：人聲分離被略過時在畫面上說明（不只寫日誌） -->
+    <div class="warn-box" id="uvrNotice" role="status" style="display:none;margin-top:0.5rem;"></div>
     <div class="mem-bar-wrap" id="memBarWrap">
       <span id="memBarLabel">JS 堆積</span>
       <div class="mem-bar-track"><div class="mem-bar-fill" id="memBarFill" style="width:0%"></div></div>
@@ -4780,8 +4782,26 @@ function encodeWavPcm16(left, right, rate) {
  * 略過（低記憶體、太長）或失敗回傳 null，原因寫入日誌，呼叫端改用原始音訊辨識。取消則丟出 CANCELLED。
  * Worker 一律在 finally 終止：取消、失敗、成功都不留下佔著數百 MB 的 Worker。
  */
+/** r9：人聲分離略過的白話提示，顯示在進度區；每次開始辨識時清空。多檔時逐行累加並標出檔名。 */
+function showUvrNotice(msg, fileName) {
+  const el = document.getElementById('uvrNotice');
+  if (!el) return;
+  const line = document.createElement('div');
+  line.textContent = (fileName ? `「${fileName}」：` : '') + msg;
+  el.appendChild(line);
+  el.style.display = '';
+}
+function clearUvrNotice() {
+  const el = document.getElementById('uvrNotice');
+  if (el) { el.textContent = ''; el.style.display = 'none'; }
+}
+
 async function runVocalSeparation(file, { wantWav = true } = {}) {
-  const skip = (why) => { log(`人聲分離略過（${why}），改用原始音訊辨識`, 'warn'); return null; };
+  const skip = (why) => {
+    log(`人聲分離略過（${why}），改用原始音訊辨識`, 'warn');
+    showUvrNotice(`已跳過「去除背景音樂」（${why}）。字幕照常產生，只是背景音樂較多的段落可能較不準。`, file && file.name);
+    return null;
+  };
   if (detectMemoryTier().tier === 'low') return skip('低記憶體裝置：模型推論需要約 1.5 GB 以上記憶體');
   const dur = await probeMediaDuration(file);
   if (isCancelled) throw new Error('CANCELLED');
@@ -5247,6 +5267,7 @@ startBtn.addEventListener('click', async () => {
 
   isRunning = true;
   isCancelled = false;
+  clearUvrNotice();
   setModelButtonsDisabled(true);   // 與 isRunning 同一時刻（早於任何 await）：辨識中切換模型會釋放執行中的 Worker
   startMemMonitor();
   await acquireWakeLock(); // 🔒 啟用螢幕常亮，防止休眠中斷辨識

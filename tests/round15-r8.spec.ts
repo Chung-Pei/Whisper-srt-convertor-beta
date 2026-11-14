@@ -348,5 +348,8 @@ test('R8-07 UVR：讀不出長度且檔案 > 長度上限×128 kbps → 略過�
   expect(r.big).toBeNull();
   expect(r.limit).toBe(1200 * 16000);
   expect(r.log).toContain('無法判斷長度且檔案過大');
+  // r9：畫面上也要有白話提示（不只日誌）
+  await expect(page.locator('#uvrNotice')).toBeVisible();
+  await expect(page.locator('#uvrNotice')).toContainText('字幕照常產生');
   expect(hits.model).toBe(0);
 });
