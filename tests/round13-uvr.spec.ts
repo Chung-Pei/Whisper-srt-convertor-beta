@@ -243,32 +243,35 @@ test.describe('r6 UVR：真實 Worker＋假 ORT', () => {
       const r = await T.runVocalSeparation(file);
       const logText = document.getElementById('logBox')!.textContent || '';
       if (!r) return { ok: false, logText, workers: (window as any).__workers.map((w: any) => w.__terminated), ms: performance.now() - t0 };
+      // r9：人聲 WAV 改為 16 kHz 單聲道（＝辨識用的 mono16k）。
+      //   eM：mono16k 與「模型輸出（各聲道×0.5）降混後、用同一個重取樣函式」的期望值比對（前後各約 3000 樣本受頻帶上限影響，不比）
+      //   eW：WAV 內容與 mono16k 相同（只差 16-bit 量化）
       const wav = new DataView(await r.wavBlob.arrayBuffer());
       const { L, R } = (window as any).__sig(Math.round(3 * 44100));
-      let eL = 0, eR = 0;
-      const nS = (wav.byteLength - 44) / 4;
-      for (let i = 9000; i < Math.min(120000, nS - 8192); i += 97) {   // 前後 8192 樣本受 17.6 kHz 頻帶上限影響，不比
-        eL = Math.max(eL, Math.abs(wav.getInt16(44 + i * 4, true) / 32768 - 0.5 * L[i]));
-        eR = Math.max(eR, Math.abs(wav.getInt16(44 + i * 4 + 2, true) / 32768 - 0.5 * R[i]));
-      }
+      const mix = new Float32Array(L.length); for (let i = 0; i < L.length; i++) mix[i] = 0.25 * (L[i] + R[i]);
+      const exp: Float32Array = (await T.resampleChannels([mix], 44100, 16000))[0];
+      let eM = 0, eW = 0;
+      for (let i = 3300; i < Math.min(exp.length, r.mono16k.length) - 3300; i += 37) eM = Math.max(eM, Math.abs(r.mono16k[i] - exp[i]));
+      for (let i = 0; i < r.mono16k.length; i += 13) eW = Math.max(eW, Math.abs(wav.getInt16(44 + i * 2, true) / 32768 - Math.max(-1, Math.min(1, r.mono16k[i]))));
+      const eL = eM, eR = eW;
       let rms = 0; for (let i = 0; i < r.mono16k.length; i++) rms += r.mono16k[i] ** 2;
-      return { ok: true, logText, mono16kLen: r.mono16k.length, wavSize: r.wavBlob.size, rate: wav.getUint32(24, true), eL, eR,
+      return { ok: true, logText, mono16kLen: r.mono16k.length, wavSize: r.wavBlob.size, rate: wav.getUint32(24, true), ch: wav.getUint16(22, true), eL, eR,
         rms: Math.sqrt(rms / r.mono16k.length), workers: (window as any).__workers.map((w: any) => w.__terminated), ms: performance.now() - t0 };
     } catch (e: any) { return { ok: false, threw: e.message, workers: (window as any).__workers.map((w: any) => w.__terminated) }; }
   }, { b64, evalBefore });
   const b64 = (sec: number) => makeWav(sec).toString('base64');
 
-  test('U-07 正常流程：人聲＝模型輸出（×0.5）、回傳 16 kHz 單聲道＋44.1 kHz 立體聲 WAV、Worker 結束後被終止', async ({ browser }) => {
+  test('U-07 正常流程：人聲＝模型輸出（×0.5）、回傳 16 kHz 單聲道＋同內容的 16 kHz 單聲道 WAV（r9）、Worker 結束後被終止', async ({ browser }) => {
     const ctx = await newCtx(browser); const page = await ctx.newPage();
     const hits = await setup(page);
     await exposeInternals(page, NAMES, 'new');
     await page.goto(BASE_URL); await page.waitForFunction(() => !!(window as any).__t);
     const r: any = await run(page, b64(3));
     expect(r.ok, JSON.stringify(r)).toBe(true);
-    expect(r.rate).toBe(44100);
-    expect(r.wavSize).toBe(44 + 3 * 44100 * 4);
+    expect(r.rate).toBe(16000); expect(r.ch).toBe(1);                 // r9：16 kHz 單聲道
+    expect(r.wavSize).toBe(44 + r.mono16kLen * 2);
     expect(Math.abs(r.mono16kLen - 48000)).toBeLessThanOrEqual(2);
-    expect(r.eL).toBeLessThan(2e-3); expect(r.eR).toBeLessThan(2e-3);
+    expect(r.eL).toBeLessThan(2e-3); expect(r.eR).toBeLessThan(1 / 32000);
     expect(r.rms).toBeGreaterThan(0.05);
     expect(r.workers).toEqual([true]);               // 只建一個 Worker，結束後已終止
     expect(r.logText).toContain('人聲分離完成');
@@ -299,9 +302,9 @@ test.describe('r6 UVR：真實 Worker＋假 ORT', () => {
     await page.goto(BASE_URL); await page.waitForFunction(() => !!(window as any).__t);
     const r: any = await run(page, b64(3), `UVR_MODEL_BYTES = ${half.length}; UVR_MODEL_SHA256 = '${sha}'`);
     expect(r.ok, JSON.stringify(r)).toBe(true);
-    expect(r.rate).toBe(44100);
-    expect(r.wavSize).toBe(44 + 3 * 44100 * 4);
-    expect(r.eL).toBeLessThan(2e-3); expect(r.eR).toBeLessThan(2e-3);   // 與 U-07（假 ORT）相同的誤差門檻
+    expect(r.rate).toBe(16000); expect(r.ch).toBe(1);                 // r9：16 kHz 單聲道
+    expect(r.wavSize).toBe(44 + r.mono16kLen * 2);
+    expect(r.eL).toBeLessThan(2e-3); expect(r.eR).toBeLessThan(1 / 32000);   // 與 U-07（假 ORT）相同的誤差門檻
     expect(r.workers).toEqual([true]);
     expect(r.logText).toContain('人聲分離完成');
     expect(served.some((f) => f.endsWith('.wasm')), `實際取用：${served.join(', ')}`).toBe(true);   // 證明真的跑了 ORT 的 WASM
@@ -539,8 +542,9 @@ test.describe('r6 UVR：真實模型（選用）', () => {
       const file = new File([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], 'mix.wav', { type: 'audio/wav' });
       const r = await T.runVocalSeparation(file);
       if (!r) return { L: [] as number[], log: document.getElementById('logBox')!.textContent, failed: true };
-      const v = new DataView(await r.wavBlob.arrayBuffer()); const m = (v.byteLength - 44) / 4, L = new Float32Array(m);
-      for (let i = 0; i < m; i++) L[i] = v.getInt16(44 + i * 4, true) / 32768;
+      // r9：人聲 WAV 為 16 kHz 單聲道 → 直接讀 WAV（16 kHz）
+      const v = new DataView(await r.wavBlob.arrayBuffer()); const m = (v.byteLength - 44) / 2, L = new Float32Array(m);
+      for (let i = 0; i < m; i++) L[i] = v.getInt16(44 + i * 2, true) / 32768;
       return { L: Array.from(L), log: document.getElementById('logBox')!.textContent, failed: false };
     }, wav.toString('base64'));
     expect(out.failed, out.log ?? '').toBeFalsy();
@@ -551,7 +555,11 @@ test.describe('r6 UVR：真實模型（選用）', () => {
       const a = dot / rr; let tg = 0, ns = 0; for (let i = 0; i < est.length; i++) { const t = a * (ref[i] - m2), e = est[i] - m1 - t; tg += t * t; ns += e * e; }
       return 10 * Math.log10(tg / ns);
     };
-    const before = sisdr(mix, speech), after = sisdr(vocal.subarray(0, n), speech);
+    // r9：人聲 WAV 為 16 kHz → 參考訊號也線性重取樣到 16 kHz 再比
+    const to16 = (x: Float32Array) => { const m = Math.floor(x.length * 16000 / 44100), y = new Float32Array(m);
+      for (let i = 0; i < m; i++) { const t = i * 44100 / 16000, k = Math.floor(t), f = t - k; y[i] = x[k] * (1 - f) + x[Math.min(k + 1, x.length - 1)] * f; } return y; };
+    const sp16 = to16(speech), mix16 = to16(mix), nn = Math.min(sp16.length, vocal.length);
+    const before = sisdr(mix16.subarray(0, nn), sp16.subarray(0, nn)), after = sisdr(vocal.subarray(0, nn), sp16.subarray(0, nn));
     console.log(`U-14 SI-SDR：混音 ${before.toFixed(1)} dB → 人聲 ${after.toFixed(1)} dB（+${(after - before).toFixed(1)}）`);
     expect(after - before).toBeGreaterThan(15);
   });

@@ -90,10 +90,11 @@ export async function buildSegments(ctx: BrowserContext, spec: CorpusSpec): Prom
 
 // ── 假 Whisper Worker（可編排；依主程式實際協定回覆）──────────────────────────────
 export type Rule = { segIdx: number; attempt?: number; silent?: boolean; crash?: string;
+  pre?: any[];   // r9：CHUNK_DONE 之前先送出的訊息（例如 PROMPT_LEAK_REMOVED）
   reply?: { type: 'CHUNK_ERROR'; error: string } | { type: 'ERROR'; payload: string } };
 
-export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm' }) {
-  await page.addInitScript(({ segments, rules, backend }) => {
+export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
+  await page.addInitScript(({ segments, rules, backend, loadErrors }) => {
     const w = window as any;
     w.__workerLog = []; w.__attempts = {}; w.__dtype = null; w.__nWorkers = 0;
     class FakeWorker extends EventTarget {
@@ -111,12 +112,14 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
         const p = msg.payload || {};
         if (msg.type === 'LOAD_MODEL') {
           w.__dtype = p.dtype;
-          w.__workerLog.push({ type: 'LOAD_MODEL', dtype: p.dtype, preferGpu: p.preferGpu, w: this.id, t: performance.now() });
+          w.__workerLog.push({ type: 'LOAD_MODEL', dtype: p.dtype, preferGpu: p.preferGpu, afterGpuFail: p.afterGpuFail, w: this.id, t: performance.now() });
+          const nLoad = w.__workerLog.filter((x: any) => x.type === 'LOAD_MODEL').length - 1;
+          if (loadErrors[nLoad]) { const m = loadErrors[nLoad]; setTimeout(() => this.emit({ type: 'ERROR', payload: m }), 3); return; }
           const be = backend === 'webgpu' && p.preferGpu !== false ? 'webgpu' : 'wasm';
           setTimeout(() => { this.emit({ type: 'BACKEND', payload: { backend: be, dtype: p.dtype } }); this.emit({ type: 'MODEL_READY', payload: { device: be } }); }, 3);
         } else if (msg.type === 'RUN_CHUNK') {
           const k = (w.__attempts[p.segIdx] = (w.__attempts[p.segIdx] ?? -1) + 1);
-          w.__workerLog.push({ type: 'RUN_CHUNK', segIdx: p.segIdx, attempt: k, dtype: w.__dtype, w: this.id, t: performance.now() });
+          w.__workerLog.push({ type: 'RUN_CHUNK', segIdx: p.segIdx, attempt: k, dtype: w.__dtype, w: this.id, t: performance.now(), prompt: p.promptText ?? null });
           const rule = rules.find((r: any) => r.segIdx === p.segIdx && (r.attempt === undefined || r.attempt === k));
           if (rule?.silent) return;
           if (rule?.crash) {
@@ -124,6 +127,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
             return;
           }
           setTimeout(() => {
+            for (const m of (rule?.pre ?? [])) this.emit({ type: m.type, payload: { ...(m.payload || {}), segIdx: p.segIdx, startSec: p.startSec } });
             if (rule?.reply?.type === 'CHUNK_ERROR') this.emit({ type: 'CHUNK_ERROR', payload: { error: rule.reply.error, segIdx: p.segIdx } });
             else if (rule?.reply?.type === 'ERROR') this.emit({ type: 'ERROR', payload: rule.reply.payload });
             else this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: segments[p.segIdx % segments.length] }, segIdx: p.segIdx, startSec: p.startSec, strideSec: p.strideSec } });
@@ -133,7 +137,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
       terminate() { this.dead = true; }
     }
     w.Worker = FakeWorker;
-  }, { segments: cfg.segments, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm' });
+  }, { segments: cfg.segments, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm', loadErrors: cfg.loadErrors ?? [] });
   await page.route('**/opencc-js@*/dist/umd/cn2t.js', (route) =>
     route.fulfill({ contentType: 'application/javascript', body: 'window.OpenCC = { Converter: () => (t) => t };' }));
 }

@@ -17,8 +17,8 @@
 <meta name="apple-mobile-web-app-title" content="字幕產生器">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon-180x180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@400;600;800&display=swap">
+<!-- r9：字型改為同源檔案（不再連線 Google Fonts，避免開頁就把使用者 IP 送到外部） -->
+<link rel="stylesheet" href="fonts/fonts.css">
 <!-- ★ 阻塞式主題初始化：偵測系統色調，inline style 優先級永遠高於 stylesheet -->
 <script>
 (function(){
@@ -336,6 +336,11 @@
 
   .drop-icon { font-size: 2.5rem; margin-bottom: 0.75rem; opacity: 0.6; }
   .drop-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.3rem; }
+  /* r9 覆核 N11：小問號說明（預設收起，主畫面只留一句） */
+  .mini-help { display: inline; }
+  .mini-help > summary { display: inline-flex; align-items: center; justify-content: center; width: 1.1rem; height: 1.1rem; margin-left: 0.25rem; border: 1px solid var(--border2); border-radius: 50%; cursor: pointer; list-style: none; font-size: 0.65rem; line-height: 1; vertical-align: middle; }
+  .mini-help > summary::-webkit-details-marker { display: none; }
+  .mini-help[open] > div { display: block; margin-top: 0.3rem; padding: 0.4rem 0.6rem; background: var(--panel2); border-radius: var(--radius); }
   .drop-hint { font-size: 0.78rem; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
 
   .options-row {
@@ -1536,10 +1541,14 @@
       <span style="font-size:0.7rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-weight:400;">選填</span>
     </label>
     <textarea id="initialPrompt" rows="2"
-      placeholder="輸入背景知識提升辨識準確率，例如：本音訊討論心臟外科手術、冠狀動脈繞道移植術、左心室射出分率。&#10;留空時不使用提示詞。"
+      placeholder="例如：今天講 MHC、T 細胞活化、細胞激素（可留空）"
       style="width:100%;resize:vertical;min-height:3rem;max-height:8rem;padding:0.55rem 0.75rem;background:var(--panel2);border:1px solid var(--border2);border-radius:var(--radius);color:var(--text);font-size:0.78rem;font-family:'IBM Plex Mono',monospace;line-height:1.5;"></textarea>
-    <div style="font-size:0.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-top:0.3rem;">
-      提示詞會讓 Whisper 偏向辨識相關詞彙，適合會議、醫學、法律等專業場景。
+    <div id="promptHelp" style="font-size:0.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-top:0.3rem;">
+      寫幾個這堂課會講到的詞，辨識會更準。
+      <details id="promptHelpMore" class="mini-help">
+        <summary aria-label="提示詞的更多說明">？</summary>
+        <div>開啟下方「醫學專有名詞標注」時，會自動加上免疫學、微生物學常用英文名詞（如 antibody、IgG、MHC、Staphylococcus aureus）與詞典裡的英文名詞，不用自己打。若模型把提示詞原文照抄進字幕，會自動刪除並在完成時告訴你。</div>
+      </details>
     </div>
   </div>
 
@@ -1758,6 +1767,8 @@
       <div class="prog-fill indeterminate" id="progFill"></div>
     </div>
     <div class="prog-eta" id="progEta"></div>
+    <!-- r9：人聲分離被略過時在畫面上說明（不只寫日誌） -->
+    <div class="warn-box" id="uvrNotice" role="status" style="display:none;margin-top:0.5rem;"></div>
     <div class="mem-bar-wrap" id="memBarWrap">
       <span id="memBarLabel">JS 堆積</span>
       <div class="mem-bar-track"><div class="mem-bar-fill" id="memBarFill" style="width:0%"></div></div>
@@ -1796,7 +1807,7 @@
     </div>
     <a id="dlVocalBtn" class="btn-dl" download="vocals.wav"
        style="display:none;margin-top:0.5rem;width:100%;text-align:center;background:rgba(0,229,160,0.07);border-color:var(--accent);color:var(--accent);">
-      🎤 下載人聲音訊（WAV）
+      🎤 下載人聲音訊（WAV，16 kHz 單聲道）
     </a>
   </div>
 </div>
@@ -1950,8 +1961,127 @@ async function importTransformers() {
 }
 `;
 
+// ── r9：初始提示詞（initial prompt）────────────────────────────────────────
+// Transformers.js 4.3.0 的 ASR pipeline 會忽略 generate_kwargs／prompt_ids，提示詞從未送進模型。
+// 改為自行組出 Whisper 的解碼器起始序列：
+//   [<|startofprev|>, …提示詞 token（最多 200 個，超過時保留最後面的）…, <|startoftranscript|>, <|語言|>, <|任務|>, (<|notimestamps|>)]
+// 以下函式會以 toString() 原樣注入 Worker（不可引用外部變數、不可用反引號）。
+const PROMPT_MAX_TOKENS = 200;
+const RESUME_SAVE_EVERY = 5;   // r9：斷點續傳每 5 段寫一次
+
+// 使用者指定（2026-11-14）：提示詞以「免疫學＋微生物學」名詞為主。這份清單一定放在詞典其他名詞之後、使用者提示詞之前，
+// 超過 200 token 截斷時（保留最後面）優先留下；越後面越重要。約 150 token，留空間給使用者提示詞。
+const PROMPT_ZH_LEAD = '以下是微生物免疫學課程的繁體中文逐字稿。';
+const PROMPT_CORE_TERMS = [
+  'innate immunity', 'adaptive immunity', 'macrophage', 'neutrophil', 'phagocytosis', 'antigen-presenting cell', 'interferon', 'TNF-α',
+  'vaccine', 'pathogen', 'exotoxin', 'lipopolysaccharide', 'peptidoglycan', 'Candida albicans', 'HIV', 'hepatitis B virus',
+  'antigen', 'antibody', 'IgG', 'IgM', 'IgA', 'IgE', 'MHC class I', 'MHC class II', 'T cell', 'B cell', 'CD4', 'CD8',
+  'cytokine', 'interleukin', 'complement', 'Gram-positive', 'Gram-negative', 'Staphylococcus aureus', 'Streptococcus',
+  'E. coli', 'Mycobacterium tuberculosis', 'endotoxin', 'virulence',
+];
+
+/** 組合送進模型的提示詞（開啟「醫學專有名詞標注」時加入名詞）：
+ *  [詞典其他英文名詞] → [免疫學／微生物學核心名詞 PROMPT_CORE_TERMS] → [使用者提示詞]。
+ *  Worker 超過 200 token 時保留最後面，所以依序優先留下：使用者提示詞 ＞ 免疫微生物核心名詞 ＞ 詞典其他名詞。 */
+function composeWhisperPrompt(userPrompt, dict, includeDict, coreTerms) {
+  const user = String(userPrompt || '').trim();
+  let glossary = '';
+  if (includeDict) {
+    const core = Array.isArray(coreTerms) ? coreTerms : (typeof PROMPT_CORE_TERMS !== 'undefined' ? PROMPT_CORE_TERMS : []);
+    const seen = new Set(core.map((t) => String(t).trim().toLowerCase()));
+    const rest = [];
+    for (const e of (Array.isArray(dict) ? dict : [])) {
+      const t = String((e && e.en) || '').trim();
+      const k = t.toLowerCase();
+      if (t && !seen.has(k)) { seen.add(k); rest.push(t); }
+    }
+    glossary = rest.concat(core.map((t) => String(t).trim()).filter(Boolean)).join(', ');
+  }
+  const parts = [];
+  // r9 覆核 N2：詞彙表全是英文，最後面的 token 若是英文，Whisper 較常輸出簡體或整句英文 → 詞彙表後面接一句繁體中文。
+  // 放在詞彙表之後（使用者提示詞之前），超過 200 token 截斷時（保留最後面）這句會先留下。
+  if (glossary) parts.push(glossary + '. ' + PROMPT_ZH_LEAD);
+  if (user) parts.push(user);
+  return parts.length ? parts.join(' ') : null;
+}
+
+/** 純函式：提示詞 token（已去除特殊 token）＋模型起始 token → decoder_input_ids。 */
+function buildPromptDecoderIds(promptIds, initTokens, prevSotId, maxTokens, firstSpecialId) {
+  if (!Array.isArray(initTokens) || initTokens.length === 0 || prevSotId == null) return null;
+  const lim = Math.max(0, maxTokens == null ? 200 : maxTokens);
+  const clean = (promptIds || []).map(Number).filter((t) => Number.isFinite(t) && t >= 0 && (firstSpecialId == null || t < firstSpecialId));
+  const kept = lim > 0 ? clean.slice(-lim) : [];
+  if (kept.length === 0) return null;
+  return [Number(prevSotId)].concat(kept, initTokens.map(Number));
+}
+
+/** 移除模型把提示詞原文「照抄」進字幕的片段（Whisper 常見幻覺）。
+ *  r9 覆核 M1：老師照順序念幾個名詞（「IgG, IgM, IgA, IgE」「T cell, B cell, CD4, CD8」）是真的上課內容，不可刪。
+ *  只有以下情況才算照抄（連續數個字詞合起來必須是提示詞原文的一段）：
+ *   (1) 長串詞彙表：≥8 個詞條連著（≥7 個分隔符號）且 ≥50 字；
+ *   (2) 這一段的輸出整段都是照抄：照抄 ≥40 字、≥6 個詞條，且占該段輸出 ≥95%
+ *       （用 95% 而非 80%：「antigen, antibody, IgG…MHC class I 都會考」這種短句照抄占 92%，仍是真的上課內容）；
+ *   (3) 整份提示詞（≥20 字）的 80% 以上原樣出現；
+ *   (4) 照抄了提示詞開頭那句「以下是…逐字稿」（老師不會這樣講）。
+ *  回傳 { chunks, removed }（removed＝移除的字詞數）。 */
+function stripPromptLeak(chunks, promptText) {
+  if (!Array.isArray(chunks) || !promptText) return { chunks: chunks, removed: 0 };
+  const norm = (s) => String(s || '').toLowerCase().split(/\s+/).join(' ').trim();
+  const P = norm(promptText);
+  const LEAD = '以下是微生物免疫學課程的繁體中文逐字稿';
+  const DELIMS = ['、', ',', '，', '。', '.', ';', '；', ':', '：'];
+  const delims = (s) => { let n = 0; for (const ch of s) if (DELIMS.indexOf(ch) >= 0) n++; return n; };
+  const segLen = norm(chunks.map((c) => String((c && c.text) || '')).join('')).length;
+  const isLeak = (s) => {
+    const L = s.length; const D = delims(s);
+    if (L >= 50 && D >= 7) return true;
+    if (L >= 40 && D >= 5 && L >= segLen * 0.95) return true;
+    if (P.length >= 20 && L >= P.length * 0.8) return true;
+    if (P.indexOf(LEAD) >= 0 && s.indexOf(LEAD) >= 0) return true;
+    return false;
+  };
+  const out = []; let removed = 0; let i = 0;
+  while (i < chunks.length) {
+    let best = -1; let acc = '';
+    for (let j = i; j < chunks.length; j++) {
+      acc += String((chunks[j] && chunks[j].text) || '');
+      const s = norm(acc);
+      if (!s || P.indexOf(s) < 0) break;
+      if (isLeak(s)) best = j;
+    }
+    if (best >= 0) { removed += best - i + 1; i = best + 1; }
+    else { out.push(chunks[i]); i++; }
+  }
+  return { chunks: out, removed: removed };
+}
+
+/** Worker 內使用：依模型設定組出 decoder_input_ids；無法組出時回傳 { ids:null, reason }。 */
+function promptDecoderIdsForPipe(pipe, promptText, language, task, maxTokens) {
+  const tok = pipe && pipe.tokenizer; const model = pipe && pipe.model;
+  if (!promptText || !tok || !model) return { ids: null, reason: 'no-tokenizer' };
+  if (typeof model._prepare_generation_config !== 'function' || typeof model._retrieve_init_tokens !== 'function') return { ids: null, reason: 'unsupported-model' };
+  const gc = model._prepare_generation_config(null, { language: language, task: task, return_timestamps: true });
+  const init = model._retrieve_init_tokens(gc);
+  let prev = gc.prev_sot_token_id;
+  if (prev == null && typeof tok.convert_tokens_to_ids === 'function') prev = tok.convert_tokens_to_ids('<|startofprev|>');
+  if (prev == null && tok.model && tok.model.tokens_to_ids) prev = tok.model.tokens_to_ids.get('<|startofprev|>');
+  if (prev == null) return { ids: null, reason: 'no-startofprev' };
+  const eos = Array.isArray(gc.eos_token_id) ? gc.eos_token_id[0] : gc.eos_token_id;
+  const firstSpecial = eos != null ? eos : gc.decoder_start_token_id;
+  const raw = tok.encode(' ' + String(promptText).trim(), { add_special_tokens: false });
+  const ids = buildPromptDecoderIds(Array.from(raw || []), init, prev, maxTokens, firstSpecial);
+  const used = ids ? ids.length - 1 - init.length : 0;
+  return { ids: ids, reason: ids ? null : 'empty', used: used, total: (raw || []).length };
+}
+
 // 【核心修復 1】：加入 await 以確保 Transformers.js 模型徹底釋放，防止 OOM
 const WORKER_CODE = `${WORKER_ERROR_FORWARD}${WORKER_IMPORT_TRANSFORMERS}
+
+// r9：初始提示詞相關函式（與主執行緒同一份原始碼）
+const PROMPT_MAX_TOKENS = ${PROMPT_MAX_TOKENS};
+${buildPromptDecoderIds.toString()}
+${stripPromptLeak.toString()}
+${promptDecoderIdsForPipe.toString()}
 
 let pipelineFn    = null;
 let ModelRegistry = null;   // v4 新增
@@ -2191,6 +2321,100 @@ async function _pickAvailableDtype(modelId, preferred) {
   }
 }
 
+// ── r9：離線時先確認「這個 dtype 需要的權重檔」在本機 ─────────────────────────────
+// 原本離線時 _pickAvailableDtype 查不到線上清單就沿用估算值，要等 transformers.js 真的去抓 .onnx 才失敗
+// （錯誤訊息是英文網路錯誤；GPU 失敗改走一般模式時，一般模式需要另一組權重，更常見）。
+const DTYPE_SUFFIX = { fp32: '', fp16: '_fp16', q8: '_quantized', int8: '_int8', uint8: '_uint8', q4: '_q4', q4f16: '_q4f16', bnb4: '_bnb4' };
+const WHISPER_SESSIONS = ['encoder_model', 'decoder_model_merged'];
+function _isOffline() { return typeof navigator !== 'undefined' && navigator.onLine === false; }
+/** 外部權重設定（config.json 的 transformers.js_config.use_external_data_format）→ 該 .onnx 的外部資料檔數量。
+ *  與 Transformers.js 4.3.0 resolveExternalDataFormat 相同：true=1、數字＝分塊數、物件以完整檔名或 session 名稱查。 */
+function _externalChunks(ext, fullName, sess) {
+  if (!ext) return 0;
+  if (typeof ext === 'object') {
+    if (Object.prototype.hasOwnProperty.call(ext, fullName)) return +ext[fullName] || 0;
+    if (Object.prototype.hasOwnProperty.call(ext, sess)) return +ext[sess] || 0;
+    return 0;
+  }
+  return +ext || 0;
+}
+/** dtype（字串或 {encoder_model, decoder_model_merged}）→ 需要的 onnx 檔（相對於模型根目錄）；
+ *  r9 覆核 N4：模型設定使用外部權重時，一併列出 *.onnx_data（、*.onnx_data_1 …）。 */
+function _weightFilesFor(dtype, ext) {
+  const out = [];
+  WHISPER_SESSIONS.forEach(function (sess) {
+    const d = typeof dtype === 'string' ? dtype : ((dtype && dtype[sess]) || 'fp32');
+    const suf = Object.prototype.hasOwnProperty.call(DTYPE_SUFFIX, d) ? DTYPE_SUFFIX[d] : '_' + d;
+    const full = sess + suf + '.onnx';
+    out.push('onnx/' + full);
+    const n = Math.min(100, _externalChunks(ext, full, sess));
+    for (let i = 0; i < n; i++) out.push('onnx/' + full + '_data' + (i === 0 ? '' : '_' + i));
+  });
+  return out;
+}
+/** 從本機（模型資料夾或瀏覽器快取）讀 config.json 的外部權重設定；讀不到回傳 null（只檢查 .onnx）。 */
+async function _localExternalDataCfg(modelId) {
+  let txt = null;
+  if (modelFolderHandle && !_folderBypass) {
+    try {
+      const loc = await _folderDirAndName(modelId + '/config.json', false);
+      if (loc) txt = await (await (await loc.dir.getFileHandle(loc.name, { create: false })).getFile()).text();
+    } catch (_) {}
+  }
+  if (!txt) {
+    try {
+      const c = await _realCache(); const tail = '/' + modelId + '/resolve/main/config.json';
+      for (const r of await c.keys()) {
+        if (String(r.url).split('?')[0].endsWith(tail)) { const res = await c.match(r); if (res) txt = await res.text(); break; }
+      }
+    } catch (_) {}
+  }
+  try { const cfg = JSON.parse(txt); const j = cfg && cfg['transformers.js_config']; return (j && j.use_external_data_format) || null; } catch (_) { return null; }
+}
+/** 回傳缺少的檔名陣列（空陣列＝都在）。查模型資料夾（非空檔）與瀏覽器快取。 */
+async function _missingWeights(modelId, dtype, ext) {
+  if (ext === undefined) ext = await _localExternalDataCfg(modelId);
+  let keys = [];
+  try { keys = (await (await _realCache()).keys()).map(function (r) { return String(r.url).split('?')[0]; }); } catch (_) {}
+  const missing = [];
+  for (const rel of _weightFilesFor(dtype, ext)) {
+    let ok = false;
+    if (modelFolderHandle && !_folderBypass) {
+      try {
+        const loc = await _folderDirAndName(modelId + '/' + rel, false);
+        if (loc) { const f = await (await loc.dir.getFileHandle(loc.name, { create: false })).getFile(); ok = f.size > 0; }
+      } catch (_) {}
+    }
+    if (!ok) { const tail = '/' + modelId + '/resolve/main/' + rel; ok = keys.some(function (u) { return u.endsWith(tail); }); }
+    if (!ok) missing.push(rel.split('/').pop());
+  }
+  return missing;
+}
+/** 離線：從偏好 dtype 開始，先找較輕、再找較重，回傳第一個權重檔齊全的；都沒有回傳 null。 */
+async function _pickOfflineDtype(modelId, preferred) {
+  const rank = DTYPE_FOOTPRINT_ORDER.indexOf(preferred);
+  const order = rank < 0 ? [preferred].concat(DTYPE_FOOTPRINT_ORDER)
+    : [preferred].concat(DTYPE_FOOTPRINT_ORDER.slice(rank + 1), DTYPE_FOOTPRINT_ORDER.slice(0, rank).reverse());
+  const ext = await _localExternalDataCfg(modelId);
+  for (const d of order) { if ((await _missingWeights(modelId, d, ext)).length === 0) return d; }
+  return null;
+}
+function _weightsMissingError(modelId, dtype, stage) {
+  const files = _weightFilesFor(dtype).map(function (r) { return r.split('/').pop(); });
+  return new Error('MODEL_WEIGHTS_MISSING: ' + JSON.stringify({ modelId: modelId, dtype: dtype, stage: stage, files: files }));
+}
+
+/** 一般模式（WASM）的 dtype：離線 → 只選本機權重齊全的（都沒有就丟 MODEL_WEIGHTS_MISSING）；
+ *  連線中 → ModelRegistry 查詢優先於主執行緒傳來的靜態估算值（payload.dtype）；查詢失敗時才用它。 */
+async function _pickWasmDtype(payload) {
+  if (_isOffline()) {
+    const d = await _pickOfflineDtype(payload.modelId, payload.dtype);
+    if (!d) throw _weightsMissingError(payload.modelId, payload.dtype, payload.afterGpuFail ? 'gpu-fallback' : 'wasm');
+    return d;
+  }
+  return _pickAvailableDtype(payload.modelId, payload.dtype);
+}
+
 let _chunkCounter = 0;
 
 self.addEventListener('message', async (e) => {
@@ -2230,16 +2454,24 @@ self.addEventListener('message', async (e) => {
             // 單一 ONNX (Xenova)：WebGPU 預設 fp32，記憶體充足時效果最佳
             dtype = 'fp32';
           }
-          self.postMessage({ type: 'BACKEND', payload: { backend: 'webgpu', dtype } });
+          // r9：離線且顯示卡模式需要的權重不在本機 → 不建 GPU session，直接改用本機已有的一般模式權重
+          if (_isOffline() && (await _missingWeights(payload.modelId, dtype)).length > 0) {
+            const wd = await _pickOfflineDtype(payload.modelId, payload.dtype);
+            if (!wd) throw _weightsMissingError(payload.modelId, payload.dtype, 'gpu');
+            device = 'wasm'; dtype = wd;
+            self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm-fallback', dtype, reason: 'gpu-weights-offline' } });
+          } else {
+            self.postMessage({ type: 'BACKEND', payload: { backend: 'webgpu', dtype } });
+          }
         } catch (_) {
+          if (String(_ && _.message || '').indexOf('MODEL_WEIGHTS_MISSING') === 0) throw _;
           device = 'wasm';
-          dtype  = await _pickAvailableDtype(payload.modelId, payload.dtype);
+          dtype  = await _pickWasmDtype(payload);
           self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm-fallback', dtype } });
         }
       } else {
         device = 'wasm';
-        // ModelRegistry 查詢優先於主執行緒傳來的靜態估算值（payload.dtype）；查詢失敗/離線時才用它
-        dtype  = await _pickAvailableDtype(payload.modelId, payload.dtype);
+        dtype  = await _pickWasmDtype(payload);
         self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm', dtype } });
       }
 
@@ -2283,22 +2515,25 @@ self.addEventListener('message', async (e) => {
       const { audioData, language, task, promptText, segIdx, startSec } = payload;
       const f32 = new Float32Array(audioData);
 
-      // 建立 generate_kwargs，注入 initial_prompt（若有）
-      const generateKwargs = {};
-      if (promptText && pipe.tokenizer) {
-        try {
-          // encode prompt text to token IDs (skip special tokens)
-          const promptIds = pipe.tokenizer.encode(promptText, { add_special_tokens: false });
-          if (promptIds && promptIds.length > 0) {
-            generateKwargs.prompt_ids = promptIds;
-          }
-        } catch (_) { /* 若 tokenizer 不支援，略過 */ }
-      }
-
       // 產出 result.chunks 每個元素含逐字 timestamp，後處理可進一步細分
       const callOpts = { language, task, return_timestamps: 'word' };
-      if (Object.keys(generateKwargs).length > 0) callOpts.generate_kwargs = generateKwargs;
+      // r9：初始提示詞。Transformers.js 4.3.0 會忽略 generate_kwargs／prompt_ids（原本提示詞從未送進模型），
+      // 改為直接給 decoder_input_ids = [<|startofprev|>, 提示詞…, <|startoftranscript|>, 語言, 任務]。
+      if (promptText) {
+        let info = null;
+        try { info = promptDecoderIdsForPipe(pipe, promptText, language, task, PROMPT_MAX_TOKENS); } catch (pe) { info = { ids: null, reason: String(pe && pe.message || pe) }; }
+        if (info && info.ids) callOpts.decoder_input_ids = info.ids;
+        self.postMessage({ type: 'PROMPT_INFO', payload: { used: info && info.used, total: info && info.total, reason: info && info.reason, segIdx: segIdx } });
+      }
       let result = await pipe(f32, callOpts);
+      if (promptText && result && Array.isArray(result.chunks)) {
+        const st = stripPromptLeak(result.chunks, promptText);
+        if (st.removed > 0) {
+          result.chunks = st.chunks;
+          result.text = st.chunks.map(function (c) { return c.text; }).join('');
+          self.postMessage({ type: 'PROMPT_LEAK_REMOVED', payload: { removed: st.removed, segIdx: segIdx, startSec: startSec } });
+        }
+      }
 
       self.postMessage({ type: 'CHUNK_DONE', payload: { result, segIdx, startSec } });
       result = null;
@@ -2357,6 +2592,23 @@ function spawnWorker(code, options) {
   finally { URL.revokeObjectURL(url); }
 }
 
+// r9：提示詞實際送進模型的情形，每次辨識只記一次（每段都會回報）
+let _promptInfoLogged = false;
+// r9 覆核 N12：這個檔案被自動移除「照抄提示詞」的段數／字詞數，辨識完成時在畫面上說明
+const _promptLeak = { segs: 0, words: 0 };
+function reportPromptInfo(x) {
+  if (_promptInfoLogged) return;
+  _promptInfoLogged = true;
+  if (x.reason || !x.used) {
+    log('⚠ 這個模型無法使用初始提示詞，已略過提示詞（字幕照常產生）', 'warn');
+    if (x.reason) log(`（技術細節，供回報問題用：${x.reason}）`, 'info');
+  } else if (x.total > x.used) {
+    log(`💬 提示詞已送進模型（太長，只用最後 ${x.used} 個單位；你自己輸入的提示詞放在最後、優先保留）`, 'info');
+  } else {
+    log(`💬 提示詞已送進模型（${x.used} 個單位）`, 'info');
+  }
+}
+
 function createWorker() {
   if (inferenceWorker) {
     inferenceWorker.terminate();
@@ -2366,6 +2618,13 @@ function createWorker() {
   inferenceWorker = spawnWorker(WORKER_CODE);
   // r9-fix：Worker 發現並刪除損壞的暫存模型檔時，用白話記一筆（之後會自動重新下載該檔）
   inferenceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'PROMPT_INFO') reportPromptInfo(e.data.payload ?? {});
+    if (e.data?.type === 'PROMPT_LEAK_REMOVED') {
+      const p = e.data.payload ?? {};
+      _promptLeak.segs++; _promptLeak.words += (p.removed ?? 0);
+      const at = Number.isFinite(p.startSec) ? `，約 ${fmtTime(p.startSec).slice(0, 8)} 起` : '';
+      log(`🧹 第 ${(p.segIdx ?? 0) + 1} 段${at}：模型把提示詞原文照抄進字幕，已自動移除（${p.removed ?? 0} 個字詞）`, 'warn');
+    }
     if (e.data?.type === 'CACHE_REPAIRED') log(`⚠ 發現損壞的模型暫存檔「${e.data.payload?.file ?? ''}」（${e.data.payload?.why ?? ''}），已刪除並重新下載`, 'warn');
   });
   // 主執行緒側攔截 Worker 未捕獲錯誤，轉為 UI log 而非 console Uncaught Error
@@ -2607,6 +2866,16 @@ const GPU_LOAD_FAILED = 'GPU_LOAD_FAILED: ';
 const MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT: ';
 const MODEL_CORRUPT_USER_MSG = '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
   + '請確認網路穩定後重新整理頁面再試；若仍失敗，可先改選其他模型，或在瀏覽器設定中清除本網站的資料後再試。';
+const MODEL_WEIGHTS_MISSING = 'MODEL_WEIGHTS_MISSING: ';
+/** r9：離線且本機沒有需要的權重檔 → 白話說明（檔名只記在技術細節）。 */
+function weightsMissingUserMsg(info = {}) {
+  const name = String(info.modelId || '').split('/').pop() || '這個模型';
+  if (info.stage === 'gpu-fallback') {
+    return `顯示卡加速無法使用，需要改用一般模式；但一般模式要用另一組模型檔，目前沒有網路、電腦裡也還沒有下載過（${name}）。`
+      + '請連上網路讓它下載一次（之後就能離線使用），或改選以前用過的模型。';
+  }
+  return `目前沒有網路，而電腦裡找不到「${name}」需要的模型檔。請連上網路讓它下載一次（之後就能離線使用），或改選以前用過的模型。`;
+}
 const MODEL_LOAD_FAILED_USER_MSG = '這個模型無法載入：可能是模型太大，或電腦記憶體不夠。請改選較小的模型（base 或 small）再試。';
 /** 覆核 r1-S3：有選「模型資料夾」時，清除網站資料不會刪到資料夾裡的檔案 → 改提示刪除資料夾內該模型的子資料夾。 */
 function modelCorruptUserMsg(modelId = "") {
@@ -2627,6 +2896,12 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
       return w;
     } catch (err) {
       const m = String(err?.message ?? err);
+      if (m.startsWith(MODEL_WEIGHTS_MISSING)) {
+        let info = {};
+        try { info = JSON.parse(m.slice(MODEL_WEIGHTS_MISSING.length)); } catch (_) {}
+        log(`（技術細節，供回報問題用：離線缺少 ${info.dtype ? JSON.stringify(info.dtype) : ''} 權重 ${(info.files || []).join(', ')}）`, 'info');
+        throw new Error(weightsMissingUserMsg({ ...info, stage: info.stage === 'wasm' && o.afterGpuFail ? 'gpu-fallback' : info.stage }));
+      }
       if (m.startsWith(MODEL_FILE_CORRUPT)) {
         if (repaired) throw new Error(modelCorruptUserMsg(modelId));   // 覆核 r2-R2-2：技術細節第一次已記過，不重複
         repaired = true;
@@ -2635,7 +2910,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
         o = { ...o, bypassFolder: true };
       } else if (m.startsWith(GPU_LOAD_FAILED) && o.preferGpu !== false) {
         markGpuFailed(modelId, m.slice(GPU_LOAD_FAILED.length));
-        o = { ...o, preferGpu: false };
+        o = { ...o, preferGpu: false, afterGpuFail: true };   // r9：新 Worker 載入前會先確認一般模式權重在本機（離線時）
       } else {
         // 覆核 r2-R2-1：模型無法解析／載入（多半是模型太大或記憶體不足）→ 白話說明＋下一步，原始訊息另記一行
         if (/protobuf|from blob failed/i.test(m)) {
@@ -2678,7 +2953,7 @@ async function reloadWorkerForRetry(kind, modelId) {
   const onBackend = (e) => { if (e.data?.type === 'BACKEND') applyBackendInfo(e.data.payload ?? {}); };
   worker.addEventListener('message', onBackend);
   try {
-    worker = await loadModelOnWorker(worker, modelId, dtype, { preferGpu }, onBackend);
+    worker = await loadModelOnWorker(worker, modelId, dtype, { preferGpu, afterGpuFail: preferGpu === false }, onBackend);
   } finally {
     worker.removeEventListener('message', onBackend);
     inferenceWorker?.removeEventListener('message', onBackend);
@@ -2691,6 +2966,8 @@ async function reloadWorkerForRetry(kind, modelId) {
 /** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
 function applyBackendInfo(x) {
   _lastBackend = x.backend ?? null;
+  if (x.reason === 'gpu-weights-offline')
+    log(`目前沒有網路，顯示卡模式需要的模型檔還沒下載過，改用電腦裡已有的一般模式模型（${x.dtype}）`, 'warn');
   const isGpu = x.backend === 'webgpu';
   document.getElementById('statModel').textContent = isGpu ? '⚡GPU' : 'CPU';
   // 更新 infoBox hint 顯示實際使用的 dtype
@@ -2844,6 +3121,7 @@ function buildLoadModelPayload(modelId, dtype, opts = {}) {
     preferGpu: opts.preferGpu ?? defaultPreferGpu(modelId),
     modelFolderHandle: modelFolderHandle ?? null,
     bypassFolder: !!opts.bypassFolder,
+    afterGpuFail: !!opts.afterGpuFail,
   };
 }
 
@@ -4763,6 +5041,17 @@ async function uvrLoadModel(onDownload) {
   return buf;
 }
 
+/** r9：PCM 16-bit 單聲道 WAV（人聲下載檔改為 16 kHz 單聲道：與辨識用的音訊相同，1 小時約 115 MB，原本 44.1 kHz 立體聲約 635 MB）。 */
+function encodeWavMono16(samples, rate) {
+  const n = samples.length, dataBytes = n * 2, buf = new ArrayBuffer(44 + dataBytes), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + dataBytes, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, dataBytes, true);
+  for (let i = 0, o = 44; i < n; i++, o += 2) { const x = samples[i], c = x > 1 ? 1 : x < -1 ? -1 : x; v.setInt16(o, Math.round(c < 0 ? c * 32768 : c * 32767), true); }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
 /** PCM 16-bit 立體聲 WAV。先削波到 ±1；負數乘 32768、正數乘 32767。 */
 function encodeWavPcm16(left, right, rate) {
   const n = left.length, dataBytes = n * 4, buf = new ArrayBuffer(44 + dataBytes), v = new DataView(buf);
@@ -4776,12 +5065,30 @@ function encodeWavPcm16(left, right, rate) {
 }
 
 /**
- * 人聲分離總流程。成功回傳 { mono16k, wavBlob }（wantWav=false 時 wavBlob 為 null）；
+ * 人聲分離總流程。成功回傳 { mono16k, wavBlob }（wavBlob＝16 kHz 單聲道 WAV；wantWav=false 時為 null）；
  * 略過（低記憶體、太長）或失敗回傳 null，原因寫入日誌，呼叫端改用原始音訊辨識。取消則丟出 CANCELLED。
  * Worker 一律在 finally 終止：取消、失敗、成功都不留下佔著數百 MB 的 Worker。
  */
+/** r9：人聲分離略過的白話提示，顯示在進度區；每次開始辨識時清空。多檔時逐行累加並標出檔名。 */
+function showUvrNotice(msg, fileName) {
+  const el = document.getElementById('uvrNotice');
+  if (!el) return;
+  const line = document.createElement('div');
+  line.textContent = (fileName ? `「${fileName}」：` : '') + msg;
+  el.appendChild(line);
+  el.style.display = '';
+}
+function clearUvrNotice() {
+  const el = document.getElementById('uvrNotice');
+  if (el) { el.textContent = ''; el.style.display = 'none'; }
+}
+
 async function runVocalSeparation(file, { wantWav = true } = {}) {
-  const skip = (why) => { log(`人聲分離略過（${why}），改用原始音訊辨識`, 'warn'); return null; };
+  const skip = (why) => {
+    log(`人聲分離略過（${why}），改用原始音訊辨識`, 'warn');
+    showUvrNotice(`已跳過「去除背景音樂」（${why}）。字幕照常產生，只是背景音樂較多的段落可能較不準。`, file && file.name);
+    return null;
+  };
   if (detectMemoryTier().tier === 'low') return skip('低記憶體裝置：模型推論需要約 1.5 GB 以上記憶體');
   const dur = await probeMediaDuration(file);
   if (isCancelled) throw new Error('CANCELLED');
@@ -4828,10 +5135,12 @@ async function runVocalSeparation(file, { wantWav = true } = {}) {
     if (rmsIn > 1e-3 && rmsOut < rmsIn * UVR_MIN_VOCAL_RATIO) {
       throw new Error(`模型輸出幾乎無聲（人聲／原音 RMS ＝ ${(rmsOut / rmsIn * 100).toFixed(2)}%）：音訊可能沒有人聲，或模型形狀不符`);
     }
-    const wavBlob = wantWav ? encodeWavPcm16(vl, vr, UVR_SR) : null;
-    for (let i = 0; i < vl.length; i++) vl[i] = 0.5 * (vl[i] + vr[i]);        // 就地降混（WAV 已編碼完）
+    for (let i = 0; i < vl.length; i++) vl[i] = 0.5 * (vl[i] + vr[i]);        // 就地降混
     vr = null; res.payload.left = res.payload.right = null;                  // v24 r8：重取樣前先放掉右聲道（20 分鐘約 212 MB）
     const mono16k = (await resampleChannels([vl], UVR_SR, SR))[0];
+    vl = null;
+    // r9：下載用的人聲 WAV 改由 16 kHz 單聲道編碼（原本 44.1 kHz 立體聲，整段辨識期間常駐記憶體，約為現在的 5.5 倍）
+    const wavBlob = wantWav ? encodeWavMono16(mono16k, SR) : null;
     log(`✓ 人聲分離完成（${total} 段，耗時 ${formatEtaSec((performance.now() - t0) / 1000)}；人聲能量為原音的 ${(rmsOut / rmsIn * 100).toFixed(0)}%）`, 'ok');
     return { mono16k, wavBlob };
   } catch (e) {
@@ -4843,20 +5152,40 @@ async function runVocalSeparation(file, { wantWav = true } = {}) {
   }
 }
 
+// r9：人聲 WAV 的下載連結。點下載後 VOCAL_URL_TTL_MS 就撤銷 blob URL（下載已開始，不需一直掛著）；
+// 再點一次時用保留的 Blob 重建連結。開始下一個檔案或清除時，連同 Blob 一起放掉。
+let VOCAL_URL_TTL_MS = 60_000;
+let _vocalBlob = null, _vocalRevokeTimer = null;
 function resetVocalDownload() {
   const a = document.getElementById('dlVocalBtn');
+  clearTimeout(_vocalRevokeTimer); _vocalRevokeTimer = null;
+  _vocalBlob = null;
   if (!a) return;
   if (a.href?.startsWith('blob:')) URL.revokeObjectURL(a.href);
   a.removeAttribute('href'); a.style.display = 'none';
+}
+
+function _onVocalClick() {
+  const a = document.getElementById('dlVocalBtn');
+  if (!a || !_vocalBlob) return;
+  if (!a.getAttribute('href')?.startsWith('blob:')) a.href = URL.createObjectURL(_vocalBlob);   // 已撤銷 → 重建（在預設動作之前）
+  const url = a.href;
+  clearTimeout(_vocalRevokeTimer);
+  _vocalRevokeTimer = setTimeout(() => {
+    _vocalRevokeTimer = null;
+    if (a.href === url) { URL.revokeObjectURL(url); a.setAttribute('href', '#'); }
+  }, VOCAL_URL_TTL_MS);
 }
 
 function showVocalDownload(blob, baseName) {
   resetVocalDownload();
   const a = document.getElementById('dlVocalBtn');
   if (!a || !blob) return;
+  _vocalBlob = blob;
   a.href = URL.createObjectURL(blob);
   a.download = `${baseName}_vocals.wav`;
   a.style.display = 'flex';
+  if (!a._vocalClickBound) { a.addEventListener('click', _onVocalClick); a._vocalClickBound = true; }
 }
 
 /** 覆核 r1：離線時粗略確認 Whisper 模型檔已在本機（Cache Storage 或模型資料夾）。
@@ -4966,8 +5295,13 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
 
     const language   = document.getElementById('language').value || undefined;
     const task       = document.getElementById('task').value;
-    const promptText = document.getElementById('initialPrompt').value.trim() || null;
-    if (promptText) log(`💬 初始提示詞已啟用（${promptText.length} 字元）`, 'info');
+    // r9：提示詞＝醫學詞典英文名詞（開啟「醫學專有名詞標注」時）＋使用者輸入的提示詞；真正送進模型（見 Worker 的 decoder_input_ids）
+    const userPrompt = document.getElementById('initialPrompt').value.trim();
+    const useDictInPrompt = !!document.getElementById('tog_medical')?.checked;
+    const promptText = composeWhisperPrompt(userPrompt, medicalDict, useDictInPrompt);
+    _promptInfoLogged = false;
+    _promptLeak.segs = 0; _promptLeak.words = 0;
+    if (promptText) log(`💬 初始提示詞已啟用（${[userPrompt ? '你的提示詞' : '', useDictInPrompt ? '免疫／微生物等醫學英文名詞' : ''].filter(Boolean).join('＋')}）`, 'info');
     const CHUNK_SEC  = 30;
     const STRIDE_SEC = 5;
     const totalSamples = audio instanceof Float32Array ? audio.length : audio.totalSamples;
@@ -4988,6 +5322,21 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     let skipCount = resumeFromChunk;
     let nextSegPromise = gen.next();
 
+    const _resumeStartedAt = Date.now();
+    let _resumeSavedIdx = resumeFromChunk;
+    const saveResumePoint = () => {
+      _resumeSavedIdx = i;
+      return taskStatePut(taskKey, {
+        status: 'active',
+        fileName: file.name, fileSize: file.size, fileLastModified: file.lastModified,
+        model: selectedModel,
+        startedAt: _resumeStartedAt,
+        lastChunkIdx: i,
+        chunks: allChunks.slice(),
+      }).catch(() => {});
+    };
+
+    try {
     while (true) {
       if (isCancelled) throw new Error('CANCELLED');
 
@@ -5085,20 +5434,23 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
 
       i++;
 
-      // ── 斷點續傳：每 chunk 完成後非同步更新狀態 ─────────────────
-      taskStatePut(taskKey, {
-        status: 'active',
-        fileName: file.name, fileSize: file.size, fileLastModified: file.lastModified,
-        model: selectedModel,
-        startedAt: Date.now(),
-        lastChunkIdx: i,
-        chunks: allChunks,
-      }).catch(() => {});
+      // ── 斷點續傳：每 RESUME_SAVE_EVERY 段寫一次（r9：原本每段都把整份 allChunks 寫進 IndexedDB，長堂課越寫越大）。
+      // 中途停止／出錯時下面的 catch 會補寫最後進度，所以不會因為間隔而少存。
+      if (i % RESUME_SAVE_EVERY === 0) saveResumePoint();
+    }
+    } catch (loopErr) {
+      // 取消：補寫最後完成的段落，下次可從這裡繼續（失敗時下方會刪除任務狀態，不必寫）
+      if (loopErr?.message === 'CANCELLED' && i > _resumeSavedIdx) await saveResumePoint();
+      throw loopErr;
     }
 
     if (skipped.length > 0) {
       const list = skipped.map((k) => `第 ${k.idx + 1} 段（${fmtTime(k.startSec).slice(0, 8)} 起）`).join('、');
       log(`⚠ ${skipped.length} 段辨識失敗已跳過：${list}`, 'warn');
+    }
+    // r9 覆核 N12：照抄提示詞被移除時，完成畫面也要說（不只寫在日誌），老師可回頭核對
+    if (_promptLeak.segs > 0) {
+      showUvrNotice(`有 ${_promptLeak.segs} 處是模型把提示詞原文照抄進字幕，已自動刪除（共 ${_promptLeak.words} 個字詞）。想核對的話，下方紀錄有寫是第幾段、從幾分幾秒開始。`, file && file.name);
     }
     setProgress(96, '後處理中...', false);
     resetEta();
@@ -5247,6 +5599,7 @@ startBtn.addEventListener('click', async () => {
 
   isRunning = true;
   isCancelled = false;
+  clearUvrNotice();
   setModelButtonsDisabled(true);   // 與 isRunning 同一時刻（早於任何 await）：辨識中切換模型會釋放執行中的 Worker
   startMemMonitor();
   await acquireWakeLock(); // 🔒 啟用螢幕常亮，防止休眠中斷辨識

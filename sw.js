@@ -22,6 +22,13 @@ const APP_SHELL = [
   `${BASE}/icons/icon-192-maskable.png`,
   `${BASE}/icons/icon-512.png`,
   `${BASE}/icons/apple-touch-icon-180x180.png`,
+  `${BASE}/fonts/fonts.css`,
+  `${BASE}/fonts/IBMPlexMono-400-latin.woff2`,
+  `${BASE}/fonts/IBMPlexMono-400-latin-ext.woff2`,
+  `${BASE}/fonts/IBMPlexMono-600-latin.woff2`,
+  `${BASE}/fonts/IBMPlexMono-600-latin-ext.woff2`,
+  `${BASE}/fonts/Syne-latin.woff2`,
+  `${BASE}/fonts/Syne-latin-ext.woff2`,
 ];
 
 // ── 安裝：快取 App Shell ──────────────────────────────────────────────────────
@@ -88,6 +95,7 @@ self.addEventListener('fetch', (event) => {
 function isStaticAsset(pathname) {
   return (
     pathname.startsWith(`${BASE}/icons/`) ||
+    pathname.startsWith(`${BASE}/fonts/`) ||
     pathname === `${BASE}/manifest.json` ||
     /\.(png|jpg|jpeg|svg|webp|ico|woff2?|ttf)$/.test(pathname)
   );

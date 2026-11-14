@@ -27,8 +27,8 @@ import { newCtx, openWithHook, routeRealOrt, REAL_ORT_AVAILABLE, HALF_MODEL_PATH
 const DIST_URL = process.env.WHISPER_DIST_TEST_URL ?? 'http://localhost:8081/index.html';
 const SAMPLE_AUDIO = path.join(__dirname, 'fixtures', 'sample.mp3');
 
-// 沙盒／受限網路下必然失敗、且與 CSP 無關的外部字型請求（CSP 本身允許這兩個網域）
-const ENV_ONLY_HOSTS = ['fonts.googleapis.com', 'fonts.gstatic.com'];
+// r9：字型已改為同源，不再豁免任何外部字型網域
+const ENV_ONLY_HOSTS: string[] = [];
 
 type Violation = { directive: string; blocked: string };
 
