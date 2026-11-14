@@ -10,6 +10,7 @@
     "test:network": "playwright test --project=network"
   },
   "devDependencies": {
+    "@huggingface/transformers": "4.3.0",
     "@playwright/test": "^1.56.0",
     "onnxruntime-web": "1.30.0",
     "serve": "^14.2.6"
