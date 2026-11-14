@@ -1,12 +1,14 @@
 // tests/round18-r9b.spec.ts — r9 第二批
 //   P-01～P-05  初始提示詞：Transformers.js 4.3.0 會忽略 generate_kwargs／prompt_ids → 改自組 decoder_input_ids
 //              （真實 whisper-tiny 驗證見 tests/manual/verify-prompt-whisper-tiny.mjs，需要網路，不在 functional 內）
+//   W-01～W-02  人聲 WAV 改 16 kHz 單聲道；下載連結點擊後即撤銷、再點重建
+//   R-01～R-02  斷點續傳每 5 段寫一次；取消時補寫最後進度
 //   D-01～D-04  離線權重預檢：載入前（含顯示卡失敗改一般模式前）確認該 dtype 需要的 .onnx 在本機；缺檔立即白話說明
 import { test, expect, type Page } from '@playwright/test';
 import { newCtx, openWithHook, installScriptedWorker, buildSegments, BASE_URL } from './harness';
 import { setToggles } from './helpers';
 
-const NAMES = ['PROMPT_CORE_TERMS', 'WORKER_CODE', 'spawnWorker', 'composeWhisperPrompt', 'buildPromptDecoderIds', 'stripPromptLeak', 'PROMPT_MAX_TOKENS', 'DEFAULT_MEDICAL_DICT'];
+const NAMES = ['encodeWavMono16', 'showVocalDownload', 'resetVocalDownload', 'RESUME_SAVE_EVERY', 'PROMPT_CORE_TERMS', 'WORKER_CODE', 'spawnWorker', 'composeWhisperPrompt', 'buildPromptDecoderIds', 'stripPromptLeak', 'PROMPT_MAX_TOKENS', 'DEFAULT_MEDICAL_DICT'];
 
 /** 用頁面的 WORKER_CODE（真實 Worker 程式）＋測試尾段建立 Worker，等 T_OK／T_ERR。 */
 async function runInWorker(page: Page, body: string) {
@@ -268,6 +270,97 @@ test.describe('r9 離線權重預檢（dtype）', () => {
     expect(loads.length).toBe(2);
     expect(loads[1]).toMatchObject({ preferGpu: false, afterGpuFail: true });
     expect(log).toContain('一般模式要用另一組模型檔，目前沒有網路');
+    await ctx.close();
+  });
+});
+
+// ── 人聲 WAV／下載連結 ───────────────────────────────────────────────
+test.describe('r9 人聲 WAV（16 kHz 單聲道）與下載連結', () => {
+  test('W-01 encodeWavMono16：標頭（單聲道、16 kHz、16-bit）、削波、長度', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const r = await page.evaluate(async () => {
+      const T = (window as any).__t;
+      const b: Blob = T.encodeWavMono16(new Float32Array([0, 0.5, -0.5, 2, -2]), 16000);
+      const v = new DataView(await b.arrayBuffer());
+      const str = (o: number) => String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
+      return { type: b.type, size: b.size, riff: str(0), wave: str(8), data: str(36), ch: v.getUint16(22, true), rate: v.getUint32(24, true),
+        byteRate: v.getUint32(28, true), align: v.getUint16(32, true), bits: v.getUint16(34, true), dataSize: v.getUint32(40, true),
+        s: [0, 1, 2, 3, 4].map((i) => v.getInt16(44 + i * 2, true)) };
+    });
+    expect(r).toMatchObject({ type: 'audio/wav', size: 54, riff: 'RIFF', wave: 'WAVE', data: 'data', ch: 1, rate: 16000, byteRate: 32000, align: 2, bits: 16, dataSize: 10 });
+    expect(r.s).toEqual([0, 16384, -16384, 32767, -32768]);
+    await ctx.close();
+  });
+
+  test('W-02 下載連結：點擊後到時即撤銷 blob URL；再點一次用保留的 Blob 重建；重設時連 Blob 一起放掉', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const r = await page.evaluate(async () => {
+      const T = (window as any).__t; T.evalIn('VOCAL_URL_TTL_MS = 80');
+      document.addEventListener('click', (e) => e.preventDefault());     // 測試中不真的觸發下載
+      const a = document.getElementById('dlVocalBtn') as HTMLAnchorElement;
+      T.showVocalDownload(new Blob(['abc'], { type: 'audio/wav' }), 'lec');
+      const u1 = a.getAttribute('href')!; const shown = a.style.display;
+      a.click();
+      await new Promise((res) => setTimeout(res, 250));
+      const afterTtl = a.getAttribute('href');
+      const u1Dead = await fetch(u1).then(() => false, () => true);
+      a.click();
+      const u2 = a.getAttribute('href')!;
+      const u2Text = await (await fetch(u2)).text();
+      T.resetVocalDownload();
+      const u2Dead = await fetch(u2).then(() => false, () => true);
+      a.click();                                                            // Blob 已放掉 → 不重建
+      return { u1, shown, afterTtl, u1Dead, u2, u2Text, u2Dead, hidden: a.style.display, hrefAfterReset: a.getAttribute('href'), download: a.download };
+    });
+    expect(r.u1).toMatch(/^blob:/); expect(r.shown).toBe('flex'); expect(r.download).toBe('lec_vocals.wav');
+    expect(r.afterTtl).toBe('#'); expect(r.u1Dead).toBe(true);
+    expect(r.u2).toMatch(/^blob:/); expect(r.u2).not.toBe(r.u1); expect(r.u2Text).toBe('abc');
+    expect(r.u2Dead).toBe(true); expect(r.hidden).toBe('none'); expect(r.hrefAfterReset).toBeNull();
+    await ctx.close();
+  });
+});
+
+// ── 斷點續傳寫入頻率 ─────────────────────────────────────────────────
+test.describe('r9 斷點續傳每 5 段寫一次', () => {
+  const longWav = (sec: number) => { const n = 16000 * sec, b = Buffer.alloc(44 + n * 2); b.write('RIFF', 0); b.writeUInt32LE(36 + n * 2, 4); b.write('WAVEfmt ', 8); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(16000, 24); b.writeUInt32LE(32000, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(n * 2, 40); for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(6000 * Math.sin(i / 9)), 44 + i * 2); return b; };
+  const spyPuts = (page: Page) => page.addInitScript(() => {
+    const w = window as any; w.__taskPuts = [];
+    const orig = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (v: any, k?: any) { if (this.name === 'task_state') w.__taskPuts.push(v?.lastChunkIdx); return orig.call(this, v, k); };
+  });
+  const setup = async (browser: any, rules: any[] = []) => {
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    const segs = await buildSegments(ctx, { segments: 3, linesPerSegment: 2, charsPerLine: 10, termRate: 0.1, seed: 9 });
+    await installScriptedWorker(page, { segments: segs, rules });
+    await spyPuts(page);
+    await page.goto(BASE_URL);
+    await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+    await setToggles(page, [], ['tog_vad', 'tog_uvr']);
+    await page.locator('#fileInput').setInputFiles({ name: 'long.wav', mimeType: 'audio/wav', buffer: longWav(300) });
+    await page.locator('#startBtn').click();
+    return { ctx, page };
+  };
+
+  test('R-01 完整跑完：只在第 0、5、10 段時寫入（原本每段都寫）', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const { ctx, page } = await setup(browser);
+    await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 90_000 });
+    const n = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'RUN_CHUNK').length);
+    const puts: number[] = await page.evaluate(() => (window as any).__taskPuts);
+    expect(n).toBeGreaterThanOrEqual(11);
+    expect(puts[0]).toBe(0);                                                   // 開始時建立任務狀態
+    expect(puts.slice(1)).toEqual(Array.from({ length: Math.floor(n / 5) }, (_, k) => (k + 1) * 5));
+    await ctx.close();
+  });
+
+  test('R-02 取消：補寫最後完成的段落（第 7 段卡住時取消 → 續傳點 7）', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const { ctx, page } = await setup(browser, [{ segIdx: 7, silent: true }]);
+    await expect.poll(() => page.evaluate(() => (window as any).__workerLog.some((x: any) => x.type === 'RUN_CHUNK' && x.segIdx === 7)), { timeout: 60_000 }).toBe(true);
+    await page.locator('#cancelBtn').click();
+    await expect.poll(() => page.evaluate(() => (window as any).__taskPuts.at(-1)), { timeout: 30_000 }).toBe(7);
+    const puts: number[] = await page.evaluate(() => (window as any).__taskPuts);
+    expect(puts).toEqual([0, 5, 7]);
     await ctx.close();
   });
 });

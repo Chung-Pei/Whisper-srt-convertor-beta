@@ -1958,6 +1958,7 @@ async function importTransformers() {
 //   [<|startofprev|>, …提示詞 token（最多 200 個，超過時保留最後面的）…, <|startoftranscript|>, <|語言|>, <|任務|>, (<|notimestamps|>)]
 // 以下函式會以 toString() 原樣注入 Worker（不可引用外部變數、不可用反引號）。
 const PROMPT_MAX_TOKENS = 200;
+const RESUME_SAVE_EVERY = 5;   // r9：斷點續傳每 5 段寫一次
 
 // 使用者指定（2026-11-14）：提示詞以「免疫學＋微生物學」名詞為主。這份清單一定放在詞典其他名詞之後、使用者提示詞之前，
 // 超過 200 token 截斷時（保留最後面）優先留下；越後面越重要。約 150 token，留空間給使用者提示詞。
@@ -5249,6 +5250,21 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     let skipCount = resumeFromChunk;
     let nextSegPromise = gen.next();
 
+    const _resumeStartedAt = Date.now();
+    let _resumeSavedIdx = resumeFromChunk;
+    const saveResumePoint = () => {
+      _resumeSavedIdx = i;
+      return taskStatePut(taskKey, {
+        status: 'active',
+        fileName: file.name, fileSize: file.size, fileLastModified: file.lastModified,
+        model: selectedModel,
+        startedAt: _resumeStartedAt,
+        lastChunkIdx: i,
+        chunks: allChunks.slice(),
+      }).catch(() => {});
+    };
+
+    try {
     while (true) {
       if (isCancelled) throw new Error('CANCELLED');
 
@@ -5346,15 +5362,14 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
 
       i++;
 
-      // ── 斷點續傳：每 chunk 完成後非同步更新狀態 ─────────────────
-      taskStatePut(taskKey, {
-        status: 'active',
-        fileName: file.name, fileSize: file.size, fileLastModified: file.lastModified,
-        model: selectedModel,
-        startedAt: Date.now(),
-        lastChunkIdx: i,
-        chunks: allChunks,
-      }).catch(() => {});
+      // ── 斷點續傳：每 RESUME_SAVE_EVERY 段寫一次（r9：原本每段都把整份 allChunks 寫進 IndexedDB，長堂課越寫越大）。
+      // 中途停止／出錯時下面的 catch 會補寫最後進度，所以不會因為間隔而少存。
+      if (i % RESUME_SAVE_EVERY === 0) saveResumePoint();
+    }
+    } catch (loopErr) {
+      // 取消：補寫最後完成的段落，下次可從這裡繼續（失敗時下方會刪除任務狀態，不必寫）
+      if (loopErr?.message === 'CANCELLED' && i > _resumeSavedIdx) await saveResumePoint();
+      throw loopErr;
     }
 
     if (skipped.length > 0) {
