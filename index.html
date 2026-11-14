@@ -1798,7 +1798,7 @@
     </div>
     <a id="dlVocalBtn" class="btn-dl" download="vocals.wav"
        style="display:none;margin-top:0.5rem;width:100%;text-align:center;background:rgba(0,229,160,0.07);border-color:var(--accent);color:var(--accent);">
-      🎤 下載人聲音訊（WAV）
+      🎤 下載人聲音訊（WAV，16 kHz 單聲道）
     </a>
   </div>
 </div>
@@ -4969,6 +4969,17 @@ async function uvrLoadModel(onDownload) {
   return buf;
 }
 
+/** r9：PCM 16-bit 單聲道 WAV（人聲下載檔改為 16 kHz 單聲道：與辨識用的音訊相同，1 小時約 115 MB，原本 44.1 kHz 立體聲約 635 MB）。 */
+function encodeWavMono16(samples, rate) {
+  const n = samples.length, dataBytes = n * 2, buf = new ArrayBuffer(44 + dataBytes), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + dataBytes, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, dataBytes, true);
+  for (let i = 0, o = 44; i < n; i++, o += 2) { const x = samples[i], c = x > 1 ? 1 : x < -1 ? -1 : x; v.setInt16(o, Math.round(c < 0 ? c * 32768 : c * 32767), true); }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
 /** PCM 16-bit 立體聲 WAV。先削波到 ±1；負數乘 32768、正數乘 32767。 */
 function encodeWavPcm16(left, right, rate) {
   const n = left.length, dataBytes = n * 4, buf = new ArrayBuffer(44 + dataBytes), v = new DataView(buf);
@@ -4982,7 +4993,7 @@ function encodeWavPcm16(left, right, rate) {
 }
 
 /**
- * 人聲分離總流程。成功回傳 { mono16k, wavBlob }（wantWav=false 時 wavBlob 為 null）；
+ * 人聲分離總流程。成功回傳 { mono16k, wavBlob }（wavBlob＝16 kHz 單聲道 WAV；wantWav=false 時為 null）；
  * 略過（低記憶體、太長）或失敗回傳 null，原因寫入日誌，呼叫端改用原始音訊辨識。取消則丟出 CANCELLED。
  * Worker 一律在 finally 終止：取消、失敗、成功都不留下佔著數百 MB 的 Worker。
  */
@@ -5052,10 +5063,12 @@ async function runVocalSeparation(file, { wantWav = true } = {}) {
     if (rmsIn > 1e-3 && rmsOut < rmsIn * UVR_MIN_VOCAL_RATIO) {
       throw new Error(`模型輸出幾乎無聲（人聲／原音 RMS ＝ ${(rmsOut / rmsIn * 100).toFixed(2)}%）：音訊可能沒有人聲，或模型形狀不符`);
     }
-    const wavBlob = wantWav ? encodeWavPcm16(vl, vr, UVR_SR) : null;
-    for (let i = 0; i < vl.length; i++) vl[i] = 0.5 * (vl[i] + vr[i]);        // 就地降混（WAV 已編碼完）
+    for (let i = 0; i < vl.length; i++) vl[i] = 0.5 * (vl[i] + vr[i]);        // 就地降混
     vr = null; res.payload.left = res.payload.right = null;                  // v24 r8：重取樣前先放掉右聲道（20 分鐘約 212 MB）
     const mono16k = (await resampleChannels([vl], UVR_SR, SR))[0];
+    vl = null;
+    // r9：下載用的人聲 WAV 改由 16 kHz 單聲道編碼（原本 44.1 kHz 立體聲，整段辨識期間常駐記憶體，約為現在的 5.5 倍）
+    const wavBlob = wantWav ? encodeWavMono16(mono16k, SR) : null;
     log(`✓ 人聲分離完成（${total} 段，耗時 ${formatEtaSec((performance.now() - t0) / 1000)}；人聲能量為原音的 ${(rmsOut / rmsIn * 100).toFixed(0)}%）`, 'ok');
     return { mono16k, wavBlob };
   } catch (e) {
@@ -5067,20 +5080,40 @@ async function runVocalSeparation(file, { wantWav = true } = {}) {
   }
 }
 
+// r9：人聲 WAV 的下載連結。點下載後 VOCAL_URL_TTL_MS 就撤銷 blob URL（下載已開始，不需一直掛著）；
+// 再點一次時用保留的 Blob 重建連結。開始下一個檔案或清除時，連同 Blob 一起放掉。
+let VOCAL_URL_TTL_MS = 60_000;
+let _vocalBlob = null, _vocalRevokeTimer = null;
 function resetVocalDownload() {
   const a = document.getElementById('dlVocalBtn');
+  clearTimeout(_vocalRevokeTimer); _vocalRevokeTimer = null;
+  _vocalBlob = null;
   if (!a) return;
   if (a.href?.startsWith('blob:')) URL.revokeObjectURL(a.href);
   a.removeAttribute('href'); a.style.display = 'none';
+}
+
+function _onVocalClick() {
+  const a = document.getElementById('dlVocalBtn');
+  if (!a || !_vocalBlob) return;
+  if (!a.getAttribute('href')?.startsWith('blob:')) a.href = URL.createObjectURL(_vocalBlob);   // 已撤銷 → 重建（在預設動作之前）
+  const url = a.href;
+  clearTimeout(_vocalRevokeTimer);
+  _vocalRevokeTimer = setTimeout(() => {
+    _vocalRevokeTimer = null;
+    if (a.href === url) { URL.revokeObjectURL(url); a.setAttribute('href', '#'); }
+  }, VOCAL_URL_TTL_MS);
 }
 
 function showVocalDownload(blob, baseName) {
   resetVocalDownload();
   const a = document.getElementById('dlVocalBtn');
   if (!a || !blob) return;
+  _vocalBlob = blob;
   a.href = URL.createObjectURL(blob);
   a.download = `${baseName}_vocals.wav`;
   a.style.display = 'flex';
+  if (!a._vocalClickBound) { a.addEventListener('click', _onVocalClick); a._vocalClickBound = true; }
 }
 
 /** 覆核 r1：離線時粗略確認 Whisper 模型檔已在本機（Cache Storage 或模型資料夾）。

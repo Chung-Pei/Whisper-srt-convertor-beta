@@ -321,7 +321,8 @@ test.describe('r8：UVR WebGPU', () => {
         const log = document.getElementById('logBox')!.textContent || '';
         if (!res) return { ok: false, log };
         const v = new DataView(await res.wavBlob.arrayBuffer()); let e = 0;
-        for (let i = 9000; i < 300000; i += 101) e = Math.max(e, Math.abs(v.getInt16(44 + i * 4, true) / 32768 - 0.25 * Math.sin(2 * Math.PI * 440 * i / 44100)));
+        // r9：人聲 WAV 為 16 kHz 單聲道＝左右聲道人聲（各為輸入×0.5）的平均
+        for (let i = 3300; i < 110000; i += 37) e = Math.max(e, Math.abs(v.getInt16(44 + i * 2, true) / 32768 - (0.125 * Math.sin(2 * Math.PI * 440 * i / 16000) + 0.1 * Math.sin(2 * Math.PI * 523.25 * i / 16000))));
         return { ok: true, e, log, uvr: (window as any).__uvr };
       }, b64);
       expect(r.ok, r.log).toBe(true);
