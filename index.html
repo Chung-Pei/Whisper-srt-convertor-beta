@@ -2280,6 +2280,62 @@ async function _pickAvailableDtype(modelId, preferred) {
   }
 }
 
+// ── r9：離線時先確認「這個 dtype 需要的權重檔」在本機 ─────────────────────────────
+// 原本離線時 _pickAvailableDtype 查不到線上清單就沿用估算值，要等 transformers.js 真的去抓 .onnx 才失敗
+// （錯誤訊息是英文網路錯誤；GPU 失敗改走一般模式時，一般模式需要另一組權重，更常見）。
+const DTYPE_SUFFIX = { fp32: '', fp16: '_fp16', q8: '_quantized', int8: '_int8', uint8: '_uint8', q4: '_q4', q4f16: '_q4f16', bnb4: '_bnb4' };
+const WHISPER_SESSIONS = ['encoder_model', 'decoder_model_merged'];
+function _isOffline() { return typeof navigator !== 'undefined' && navigator.onLine === false; }
+/** dtype（字串或 {encoder_model, decoder_model_merged}）→ 需要的 onnx 檔（相對於模型根目錄）。 */
+function _weightFilesFor(dtype) {
+  return WHISPER_SESSIONS.map(function (sess) {
+    const d = typeof dtype === 'string' ? dtype : ((dtype && dtype[sess]) || 'fp32');
+    const suf = Object.prototype.hasOwnProperty.call(DTYPE_SUFFIX, d) ? DTYPE_SUFFIX[d] : '_' + d;
+    return 'onnx/' + sess + suf + '.onnx';
+  });
+}
+/** 回傳缺少的檔名陣列（空陣列＝都在）。查模型資料夾（非空檔）與瀏覽器快取。 */
+async function _missingWeights(modelId, dtype) {
+  let keys = [];
+  try { keys = (await (await _realCache()).keys()).map(function (r) { return String(r.url).split('?')[0]; }); } catch (_) {}
+  const missing = [];
+  for (const rel of _weightFilesFor(dtype)) {
+    let ok = false;
+    if (modelFolderHandle && !_folderBypass) {
+      try {
+        const loc = await _folderDirAndName(modelId + '/' + rel, false);
+        if (loc) { const f = await (await loc.dir.getFileHandle(loc.name, { create: false })).getFile(); ok = f.size > 0; }
+      } catch (_) {}
+    }
+    if (!ok) { const tail = '/' + modelId + '/resolve/main/' + rel; ok = keys.some(function (u) { return u.endsWith(tail); }); }
+    if (!ok) missing.push(rel.split('/').pop());
+  }
+  return missing;
+}
+/** 離線：從偏好 dtype 開始，先找較輕、再找較重，回傳第一個權重檔齊全的；都沒有回傳 null。 */
+async function _pickOfflineDtype(modelId, preferred) {
+  const rank = DTYPE_FOOTPRINT_ORDER.indexOf(preferred);
+  const order = rank < 0 ? [preferred].concat(DTYPE_FOOTPRINT_ORDER)
+    : [preferred].concat(DTYPE_FOOTPRINT_ORDER.slice(rank + 1), DTYPE_FOOTPRINT_ORDER.slice(0, rank).reverse());
+  for (const d of order) { if ((await _missingWeights(modelId, d)).length === 0) return d; }
+  return null;
+}
+function _weightsMissingError(modelId, dtype, stage) {
+  const files = _weightFilesFor(dtype).map(function (r) { return r.split('/').pop(); });
+  return new Error('MODEL_WEIGHTS_MISSING: ' + JSON.stringify({ modelId: modelId, dtype: dtype, stage: stage, files: files }));
+}
+
+/** 一般模式（WASM）的 dtype：離線 → 只選本機權重齊全的（都沒有就丟 MODEL_WEIGHTS_MISSING）；
+ *  連線中 → ModelRegistry 查詢優先於主執行緒傳來的靜態估算值（payload.dtype）；查詢失敗時才用它。 */
+async function _pickWasmDtype(payload) {
+  if (_isOffline()) {
+    const d = await _pickOfflineDtype(payload.modelId, payload.dtype);
+    if (!d) throw _weightsMissingError(payload.modelId, payload.dtype, payload.afterGpuFail ? 'gpu-fallback' : 'wasm');
+    return d;
+  }
+  return _pickAvailableDtype(payload.modelId, payload.dtype);
+}
+
 let _chunkCounter = 0;
 
 self.addEventListener('message', async (e) => {
@@ -2319,16 +2375,24 @@ self.addEventListener('message', async (e) => {
             // 單一 ONNX (Xenova)：WebGPU 預設 fp32，記憶體充足時效果最佳
             dtype = 'fp32';
           }
-          self.postMessage({ type: 'BACKEND', payload: { backend: 'webgpu', dtype } });
+          // r9：離線且顯示卡模式需要的權重不在本機 → 不建 GPU session，直接改用本機已有的一般模式權重
+          if (_isOffline() && (await _missingWeights(payload.modelId, dtype)).length > 0) {
+            const wd = await _pickOfflineDtype(payload.modelId, payload.dtype);
+            if (!wd) throw _weightsMissingError(payload.modelId, payload.dtype, 'gpu');
+            device = 'wasm'; dtype = wd;
+            self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm-fallback', dtype, reason: 'gpu-weights-offline' } });
+          } else {
+            self.postMessage({ type: 'BACKEND', payload: { backend: 'webgpu', dtype } });
+          }
         } catch (_) {
+          if (String(_ && _.message || '').indexOf('MODEL_WEIGHTS_MISSING') === 0) throw _;
           device = 'wasm';
-          dtype  = await _pickAvailableDtype(payload.modelId, payload.dtype);
+          dtype  = await _pickWasmDtype(payload);
           self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm-fallback', dtype } });
         }
       } else {
         device = 'wasm';
-        // ModelRegistry 查詢優先於主執行緒傳來的靜態估算值（payload.dtype）；查詢失敗/離線時才用它
-        dtype  = await _pickAvailableDtype(payload.modelId, payload.dtype);
+        dtype  = await _pickWasmDtype(payload);
         self.postMessage({ type: 'BACKEND', payload: { backend: 'wasm', dtype } });
       }
 
@@ -2716,6 +2780,16 @@ const GPU_LOAD_FAILED = 'GPU_LOAD_FAILED: ';
 const MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT: ';
 const MODEL_CORRUPT_USER_MSG = '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
   + '請確認網路穩定後重新整理頁面再試；若仍失敗，可先改選其他模型，或在瀏覽器設定中清除本網站的資料後再試。';
+const MODEL_WEIGHTS_MISSING = 'MODEL_WEIGHTS_MISSING: ';
+/** r9：離線且本機沒有需要的權重檔 → 白話說明（檔名只記在技術細節）。 */
+function weightsMissingUserMsg(info = {}) {
+  const name = String(info.modelId || '').split('/').pop() || '這個模型';
+  if (info.stage === 'gpu-fallback') {
+    return `顯示卡加速無法使用，需要改用一般模式；但一般模式要用另一組模型檔，目前沒有網路、電腦裡也還沒有下載過（${name}）。`
+      + '請連上網路讓它下載一次（之後就能離線使用），或改選以前用過的模型。';
+  }
+  return `目前沒有網路，而電腦裡找不到「${name}」需要的模型檔。請連上網路讓它下載一次（之後就能離線使用），或改選以前用過的模型。`;
+}
 const MODEL_LOAD_FAILED_USER_MSG = '這個模型無法載入：可能是模型太大，或電腦記憶體不夠。請改選較小的模型（base 或 small）再試。';
 /** 覆核 r1-S3：有選「模型資料夾」時，清除網站資料不會刪到資料夾裡的檔案 → 改提示刪除資料夾內該模型的子資料夾。 */
 function modelCorruptUserMsg(modelId = "") {
@@ -2736,6 +2810,12 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
       return w;
     } catch (err) {
       const m = String(err?.message ?? err);
+      if (m.startsWith(MODEL_WEIGHTS_MISSING)) {
+        let info = {};
+        try { info = JSON.parse(m.slice(MODEL_WEIGHTS_MISSING.length)); } catch (_) {}
+        log(`（技術細節，供回報問題用：離線缺少 ${info.dtype ? JSON.stringify(info.dtype) : ''} 權重 ${(info.files || []).join(', ')}）`, 'info');
+        throw new Error(weightsMissingUserMsg({ ...info, stage: info.stage === 'wasm' && o.afterGpuFail ? 'gpu-fallback' : info.stage }));
+      }
       if (m.startsWith(MODEL_FILE_CORRUPT)) {
         if (repaired) throw new Error(modelCorruptUserMsg(modelId));   // 覆核 r2-R2-2：技術細節第一次已記過，不重複
         repaired = true;
@@ -2744,7 +2824,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
         o = { ...o, bypassFolder: true };
       } else if (m.startsWith(GPU_LOAD_FAILED) && o.preferGpu !== false) {
         markGpuFailed(modelId, m.slice(GPU_LOAD_FAILED.length));
-        o = { ...o, preferGpu: false };
+        o = { ...o, preferGpu: false, afterGpuFail: true };   // r9：新 Worker 載入前會先確認一般模式權重在本機（離線時）
       } else {
         // 覆核 r2-R2-1：模型無法解析／載入（多半是模型太大或記憶體不足）→ 白話說明＋下一步，原始訊息另記一行
         if (/protobuf|from blob failed/i.test(m)) {
@@ -2787,7 +2867,7 @@ async function reloadWorkerForRetry(kind, modelId) {
   const onBackend = (e) => { if (e.data?.type === 'BACKEND') applyBackendInfo(e.data.payload ?? {}); };
   worker.addEventListener('message', onBackend);
   try {
-    worker = await loadModelOnWorker(worker, modelId, dtype, { preferGpu }, onBackend);
+    worker = await loadModelOnWorker(worker, modelId, dtype, { preferGpu, afterGpuFail: preferGpu === false }, onBackend);
   } finally {
     worker.removeEventListener('message', onBackend);
     inferenceWorker?.removeEventListener('message', onBackend);
@@ -2800,6 +2880,8 @@ async function reloadWorkerForRetry(kind, modelId) {
 /** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
 function applyBackendInfo(x) {
   _lastBackend = x.backend ?? null;
+  if (x.reason === 'gpu-weights-offline')
+    log(`目前沒有網路，顯示卡模式需要的模型檔還沒下載過，改用電腦裡已有的一般模式模型（${x.dtype}）`, 'warn');
   const isGpu = x.backend === 'webgpu';
   document.getElementById('statModel').textContent = isGpu ? '⚡GPU' : 'CPU';
   // 更新 infoBox hint 顯示實際使用的 dtype
@@ -2953,6 +3035,7 @@ function buildLoadModelPayload(modelId, dtype, opts = {}) {
     preferGpu: opts.preferGpu ?? defaultPreferGpu(modelId),
     modelFolderHandle: modelFolderHandle ?? null,
     bypassFolder: !!opts.bypassFolder,
+    afterGpuFail: !!opts.afterGpuFail,
   };
 }
 

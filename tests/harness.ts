@@ -92,8 +92,8 @@ export async function buildSegments(ctx: BrowserContext, spec: CorpusSpec): Prom
 export type Rule = { segIdx: number; attempt?: number; silent?: boolean; crash?: string;
   reply?: { type: 'CHUNK_ERROR'; error: string } | { type: 'ERROR'; payload: string } };
 
-export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm' }) {
-  await page.addInitScript(({ segments, rules, backend }) => {
+export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
+  await page.addInitScript(({ segments, rules, backend, loadErrors }) => {
     const w = window as any;
     w.__workerLog = []; w.__attempts = {}; w.__dtype = null; w.__nWorkers = 0;
     class FakeWorker extends EventTarget {
@@ -111,7 +111,9 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
         const p = msg.payload || {};
         if (msg.type === 'LOAD_MODEL') {
           w.__dtype = p.dtype;
-          w.__workerLog.push({ type: 'LOAD_MODEL', dtype: p.dtype, preferGpu: p.preferGpu, w: this.id, t: performance.now() });
+          w.__workerLog.push({ type: 'LOAD_MODEL', dtype: p.dtype, preferGpu: p.preferGpu, afterGpuFail: p.afterGpuFail, w: this.id, t: performance.now() });
+          const nLoad = w.__workerLog.filter((x: any) => x.type === 'LOAD_MODEL').length - 1;
+          if (loadErrors[nLoad]) { const m = loadErrors[nLoad]; setTimeout(() => this.emit({ type: 'ERROR', payload: m }), 3); return; }
           const be = backend === 'webgpu' && p.preferGpu !== false ? 'webgpu' : 'wasm';
           setTimeout(() => { this.emit({ type: 'BACKEND', payload: { backend: be, dtype: p.dtype } }); this.emit({ type: 'MODEL_READY', payload: { device: be } }); }, 3);
         } else if (msg.type === 'RUN_CHUNK') {
@@ -133,7 +135,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
       terminate() { this.dead = true; }
     }
     w.Worker = FakeWorker;
-  }, { segments: cfg.segments, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm' });
+  }, { segments: cfg.segments, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm', loadErrors: cfg.loadErrors ?? [] });
   await page.route('**/opencc-js@*/dist/umd/cn2t.js', (route) =>
     route.fulfill({ contentType: 'application/javascript', body: 'window.OpenCC = { Converter: () => (t) => t };' }));
 }

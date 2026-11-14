@@ -1,6 +1,7 @@
 // tests/round18-r9b.spec.ts — r9 第二批
 //   P-01～P-05  初始提示詞：Transformers.js 4.3.0 會忽略 generate_kwargs／prompt_ids → 改自組 decoder_input_ids
 //              （真實 whisper-tiny 驗證見 tests/manual/verify-prompt-whisper-tiny.mjs，需要網路，不在 functional 內）
+//   D-01～D-04  離線權重預檢：載入前（含顯示卡失敗改一般模式前）確認該 dtype 需要的 .onnx 在本機；缺檔立即白話說明
 import { test, expect, type Page } from '@playwright/test';
 import { newCtx, openWithHook, installScriptedWorker, buildSegments, BASE_URL } from './harness';
 import { setToggles } from './helpers';
@@ -155,6 +156,111 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
     expect(p1[0]).toContain('Myocardial Infarction');
     expect(p1[0].endsWith('. 本課程是微生物與免疫學')).toBe(true);
     expect(await page.locator('#logBox').textContent()).toContain('初始提示詞已啟用（你的提示詞＋醫學詞典英文名詞）');
+    await ctx.close();
+  });
+});
+
+// ── 離線權重預檢 ────────────────────────────────────────────────────
+const WAV8 = (() => { const n = 16000 * 8, b = Buffer.alloc(44 + n * 2); b.write('RIFF', 0); b.writeUInt32LE(36 + n * 2, 4); b.write('WAVEfmt ', 8); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(16000, 24); b.writeUInt32LE(32000, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(n * 2, 40); for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(8000 * Math.sin(i / 10)), 44 + i * 2); return b; })();
+const M = 'Xenova/whisper-base';
+const seedW = (files: string[]) => `{
+  const c = await caches.open('transformers-cache');
+  for (const k of await c.keys()) await c.delete(k);
+  for (const f of ${JSON.stringify(files)}) await c.put('https://huggingface.co/${M}/resolve/main/onnx/' + f, new Response('x'));
+}`;
+
+test.describe('r9 離線權重預檢（dtype）', () => {
+  test('D-01 dtype → 需要的權重檔名；_pickOfflineDtype 先找較輕、再找較重，都沒有回 null', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const res = await runInWorker(page, `
+      const names = { q8: _weightFilesFor('q8'), fp32: _weightFilesFor('fp32'), mix: _weightFilesFor({ encoder_model: 'fp16', decoder_model_merged: 'q4' }) };
+      ${seedW(['encoder_model_quantized.onnx', 'decoder_model_merged_quantized.onnx', 'encoder_model.onnx'])}
+      const a = await _pickOfflineDtype('${M}', 'fp32');       // fp32 只有 encoder → 較輕的 q8
+      const b = await _pickOfflineDtype('${M}', 'q4');         // q4 沒有 → 沒有更輕的 → 較重的 q8
+      const miss = await _missingWeights('${M}', 'fp32');
+      ${seedW([])}
+      const none = await _pickOfflineDtype('${M}', 'q8');
+      return { names, a, b, miss, none };
+    `);
+    expect(res.type, JSON.stringify(res)).toBe('T_OK');
+    expect(res.out.names.q8).toEqual(['onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx']);
+    expect(res.out.names.fp32).toEqual(['onnx/encoder_model.onnx', 'onnx/decoder_model_merged.onnx']);
+    expect(res.out.names.mix).toEqual(['onnx/encoder_model_fp16.onnx', 'onnx/decoder_model_merged_q4.onnx']);
+    expect(res.out.a).toBe('q8'); expect(res.out.b).toBe('q8');
+    expect(res.out.miss).toEqual(['decoder_model_merged.onnx']);
+    expect(res.out.none).toBeNull();
+    await ctx.close();
+  });
+
+  test('D-02 真實 Worker LOAD_MODEL（離線）：缺檔 → 不呼叫 pipeline、立即回 MODEL_WEIGHTS_MISSING；有其他 dtype → 改用它；顯示卡權重缺 → 直接用本機一般模式權重', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const res = await runInWorker(page, `
+      _isOffline = function () { return true; };
+      loadLib = async function () {};
+      const calls = [];
+      pipelineFn = async function (task, id, o) { calls.push({ id: id, dtype: o.dtype, device: o.device }); return { dispose: async function () {} }; };
+      const out = []; const post = self.postMessage.bind(self);
+      self.postMessage = function (m) { out.push({ type: m.type, payload: m.payload }); };
+      const load = async function (p) {
+        self.dispatchEvent(new MessageEvent('message', { data: { type: 'LOAD_MODEL', payload: Object.assign({ modelId: '${M}', dtype: 'q8', preferGpu: false }, p) } }));
+        await new Promise(function (r) { setTimeout(r, 300); });
+      };
+      ${seedW([])}
+      const t0 = performance.now(); await load({}); const ms = performance.now() - t0;
+      const afterEmpty = calls.length;
+      await load({ afterGpuFail: true });
+      ${seedW(['encoder_model_q4.onnx', 'decoder_model_merged_q4.onnx'])}
+      await load({});
+      Object.defineProperty(self.navigator, 'gpu', { value: { requestAdapter: async function () { return {}; } }, configurable: true });
+      await load({ preferGpu: true });
+      self.postMessage = post;
+      return { out: out, calls: calls, afterEmpty: afterEmpty, ms: ms };
+    `);
+    expect(res.type, JSON.stringify(res)).toBe('T_OK');
+    const { out, calls, afterEmpty } = res.out;
+    const errs = out.filter((m: any) => m.type === 'ERROR').map((m: any) => String(m.payload));
+    expect(afterEmpty).toBe(0);                                     // 缺檔時沒有去載入（不會等下載失敗）
+    expect(errs[0]).toMatch(/^MODEL_WEIGHTS_MISSING: /);
+    expect(JSON.parse(errs[0].slice('MODEL_WEIGHTS_MISSING: '.length))).toMatchObject({ modelId: M, dtype: 'q8', stage: 'wasm' });
+    expect(JSON.parse(errs[1].slice('MODEL_WEIGHTS_MISSING: '.length)).stage).toBe('gpu-fallback');
+    expect(calls[0]).toEqual({ id: M, dtype: 'q4', device: 'wasm' });   // 只有 q4 在本機 → 用 q4
+    expect(calls[1]).toEqual({ id: M, dtype: 'q4', device: 'wasm' });   // 顯示卡要 fp32、不在本機 → 不建 GPU session
+    const be = out.filter((m: any) => m.type === 'BACKEND').map((m: any) => m.payload);
+    expect(be.at(-1)).toMatchObject({ backend: 'wasm-fallback', dtype: 'q4', reason: 'gpu-weights-offline' });
+    await ctx.close();
+  });
+
+  const runWithLoadErrors = async (browser: any, loadErrors: (string | null)[]) => {
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    const segs = await buildSegments(ctx, { segments: 2, linesPerSegment: 2, charsPerLine: 10, termRate: 0.1, seed: 7 });
+    await installScriptedWorker(page, { segments: segs, loadErrors });
+    await page.goto(BASE_URL);
+    await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+    await setToggles(page, [], ['tog_vad', 'tog_uvr']);
+    await page.locator('#fileInput').setInputFiles({ name: 'x.wav', mimeType: 'audio/wav', buffer: WAV8 });
+    await page.locator('#startBtn').click();
+    await expect(page.locator('.batch-item.error')).toHaveCount(1, { timeout: 60_000 });
+    const log = (await page.locator('#logBox').textContent()) ?? '';
+    const loads = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'LOAD_MODEL'));
+    const itemText = (await page.locator('.batch-item.error').textContent()) ?? '';
+    return { ctx, log, loads, itemText };
+  };
+  const missing = (stage: string) => 'MODEL_WEIGHTS_MISSING: ' + JSON.stringify({ modelId: M, dtype: 'q8', stage, files: ['encoder_model_quantized.onnx', 'decoder_model_merged_quantized.onnx'] });
+
+  test('D-03 主程式：Worker 回報離線缺權重 → 白話訊息（不說顯示卡、不夾檔名），檔名只在技術細節', async ({ browser }) => {
+    const { ctx, log, loads } = await runWithLoadErrors(browser, [missing('wasm')]);
+    expect(loads.length).toBe(1);                                   // 不重試、不降級
+    expect(log).toContain('目前沒有網路，而電腦裡找不到「whisper-base」需要的模型檔');
+    expect(log).not.toContain('顯示卡加速無法使用');
+    expect(log).toContain('技術細節，供回報問題用：離線缺少');
+    await ctx.close();
+  });
+
+  test('D-04 主程式：顯示卡失敗 → 改一般模式前 Worker 預檢缺檔 → 說明「一般模式要另一組模型檔」；第二次載入帶 afterGpuFail', async ({ browser }) => {
+    const { ctx, log, loads } = await runWithLoadErrors(browser, ['GPU_LOAD_FAILED: shader compile failed', missing('wasm')]);
+    expect(loads.length).toBe(2);
+    expect(loads[1]).toMatchObject({ preferGpu: false, afterGpuFail: true });
+    expect(log).toContain('一般模式要用另一組模型檔，目前沒有網路');
     await ctx.close();
   });
 });
