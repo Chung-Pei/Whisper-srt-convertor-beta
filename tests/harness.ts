@@ -116,7 +116,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
           setTimeout(() => { this.emit({ type: 'BACKEND', payload: { backend: be, dtype: p.dtype } }); this.emit({ type: 'MODEL_READY', payload: { device: be } }); }, 3);
         } else if (msg.type === 'RUN_CHUNK') {
           const k = (w.__attempts[p.segIdx] = (w.__attempts[p.segIdx] ?? -1) + 1);
-          w.__workerLog.push({ type: 'RUN_CHUNK', segIdx: p.segIdx, attempt: k, dtype: w.__dtype, w: this.id, t: performance.now() });
+          w.__workerLog.push({ type: 'RUN_CHUNK', segIdx: p.segIdx, attempt: k, dtype: w.__dtype, w: this.id, t: performance.now(), prompt: p.promptText ?? null });
           const rule = rules.find((r: any) => r.segIdx === p.segIdx && (r.attempt === undefined || r.attempt === k));
           if (rule?.silent) return;
           if (rule?.crash) {
