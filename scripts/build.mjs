@@ -59,8 +59,8 @@ const csp = [
   // r6：UVR 模型（Kim_Vocal_2.onnx）也從 huggingface.co 下載（Hallo 鏡像，SHA-256 與官方檔相同），所以不需要 github.com／githubusercontent.com——
   // 那些主機不回 CORS 標頭，開放了也無法 fetch；r5 以前為舊 UVR 設計留的三個 GitHub 主機一併移除（最小權限）。
   `connect-src 'self' blob: https://huggingface.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.huggingface.co https://*.hf.co https://cdn.jsdelivr.net`,
-  `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
-  `font-src https://fonts.gstatic.com`,
+  `style-src 'self' 'unsafe-inline'`,
+  `font-src 'self'`,
   // data:：index.html 的 body::before 使用 data:image/svg+xml 雜訊背景（實測 img-src 'self' 會被擋）
   `img-src 'self' data:`,
   // media-src：預覽面板的 <audio>/<video> 使用 blob: URL（實測缺少此指令時預覽面板會觸發 media-src 違規）
@@ -106,6 +106,7 @@ fs.writeFileSync(path.join(DIST, 'index.html'), distIndexHtml, 'utf8');
 fs.writeFileSync(path.join(DIST, 'sw.js'), distSwJs, 'utf8');
 fs.cpSync(path.join(ROOT, 'manifest.json'), path.join(DIST, 'manifest.json'));
 fs.cpSync(path.join(ROOT, 'icons'), path.join(DIST, 'icons'), { recursive: true });
+fs.cpSync(path.join(ROOT, 'fonts'), path.join(DIST, 'fonts'), { recursive: true });
 
 // ── 10. 印出這次的 CACHE_VERSION 與 3 個 hash 值 ───────────────────────────────
 console.log(`[build] CACHE_VERSION = ${CACHE_VERSION}`);
