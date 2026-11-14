@@ -1962,6 +1962,7 @@ const RESUME_SAVE_EVERY = 5;   // r9：斷點續傳每 5 段寫一次
 
 // 使用者指定（2026-11-14）：提示詞以「免疫學＋微生物學」名詞為主。這份清單一定放在詞典其他名詞之後、使用者提示詞之前，
 // 超過 200 token 截斷時（保留最後面）優先留下；越後面越重要。約 150 token，留空間給使用者提示詞。
+const PROMPT_ZH_LEAD = '以下是微生物免疫學課程的繁體中文逐字稿。';
 const PROMPT_CORE_TERMS = [
   'innate immunity', 'adaptive immunity', 'macrophage', 'neutrophil', 'phagocytosis', 'antigen-presenting cell', 'interferon', 'TNF-α',
   'vaccine', 'pathogen', 'exotoxin', 'lipopolysaccharide', 'peptidoglycan', 'Candida albicans', 'HIV', 'hepatitis B virus',
@@ -1988,7 +1989,9 @@ function composeWhisperPrompt(userPrompt, dict, includeDict, coreTerms) {
     glossary = rest.concat(core.map((t) => String(t).trim()).filter(Boolean)).join(', ');
   }
   const parts = [];
-  if (glossary) parts.push(glossary + '.');
+  // r9 覆核 N2：詞彙表全是英文，最後面的 token 若是英文，Whisper 較常輸出簡體或整句英文 → 詞彙表後面接一句繁體中文。
+  // 放在詞彙表之後（使用者提示詞之前），超過 200 token 截斷時（保留最後面）這句會先留下。
+  if (glossary) parts.push(glossary + '. ' + PROMPT_ZH_LEAD);
   if (user) parts.push(user);
   return parts.length ? parts.join(' ') : null;
 }
@@ -2004,16 +2007,30 @@ function buildPromptDecoderIds(promptIds, initTokens, prevSotId, maxTokens, firs
 }
 
 /** 移除模型把提示詞原文「照抄」進字幕的片段（Whisper 常見幻覺）。
- *  連續數個字詞合起來是提示詞的一段、且夠長（≥16 字（提示詞較短時為整段、至少 8 字），並且含 ≥2 個分隔符號＝連著背出三個以上詞條，或占提示詞 60% 以上）才移除；
- *  單獨講到提示詞裡的醫學名詞（例如 Hypertension）不會被移除。回傳 { chunks, removed }。 */
+ *  r9 覆核 M1：老師照順序念幾個名詞（「IgG, IgM, IgA, IgE」「T cell, B cell, CD4, CD8」）是真的上課內容，不可刪。
+ *  只有以下情況才算照抄（連續數個字詞合起來必須是提示詞原文的一段）：
+ *   (1) 長串詞彙表：≥8 個詞條連著（≥7 個分隔符號）且 ≥50 字；
+ *   (2) 這一段的輸出整段都是照抄：照抄 ≥40 字、≥6 個詞條，且占該段輸出 ≥95%
+ *       （用 95% 而非 80%：「antigen, antibody, IgG…MHC class I 都會考」這種短句照抄占 92%，仍是真的上課內容）；
+ *   (3) 整份提示詞（≥20 字）的 80% 以上原樣出現；
+ *   (4) 照抄了提示詞開頭那句「以下是…逐字稿」（老師不會這樣講）。
+ *  回傳 { chunks, removed }（removed＝移除的字詞數）。 */
 function stripPromptLeak(chunks, promptText) {
   if (!Array.isArray(chunks) || !promptText) return { chunks: chunks, removed: 0 };
   const norm = (s) => String(s || '').toLowerCase().split(/\s+/).join(' ').trim();
   const P = norm(promptText);
+  const LEAD = '以下是微生物免疫學課程的繁體中文逐字稿';
   const DELIMS = ['、', ',', '，', '。', '.', ';', '；', ':', '：'];
   const delims = (s) => { let n = 0; for (const ch of s) if (DELIMS.indexOf(ch) >= 0) n++; return n; };
-  const minLen = Math.max(8, Math.min(16, P.length));
-  const isLeak = (s) => s.length >= minLen && (delims(s) >= 2 || s.length >= P.length * 0.6);
+  const segLen = norm(chunks.map((c) => String((c && c.text) || '')).join('')).length;
+  const isLeak = (s) => {
+    const L = s.length; const D = delims(s);
+    if (L >= 50 && D >= 7) return true;
+    if (L >= 40 && D >= 5 && L >= segLen * 0.95) return true;
+    if (P.length >= 20 && L >= P.length * 0.8) return true;
+    if (P.indexOf(LEAD) >= 0 && s.indexOf(LEAD) >= 0) return true;
+    return false;
+  };
   const out = []; let removed = 0; let i = 0;
   while (i < chunks.length) {
     let best = -1; let acc = '';

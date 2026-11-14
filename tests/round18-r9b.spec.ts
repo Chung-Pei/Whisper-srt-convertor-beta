@@ -3,6 +3,8 @@
 //              （真實 whisper-tiny 驗證見 tests/manual/verify-prompt-whisper-tiny.mjs，需要網路，不在 functional 內）
 //   W-01～W-02  人聲 WAV 改 16 kHz 單聲道；下載連結點擊後即撤銷、再點重建
 //   R-01～R-02  斷點續傳每 5 段寫一次；取消時補寫最後進度
+//   P-06        覆核 M1：照順序念的名詞不可被當成照抄刪掉
+//   D-05        覆核 N4：外部權重 *.onnx_data 也列入預檢
 //   D-01～D-04  離線權重預檢：載入前（含顯示卡失敗改一般模式前）確認該 dtype 需要的 .onnx 在本機；缺檔立即白話說明
 import { test, expect, type Page } from '@playwright/test';
 import { newCtx, openWithHook, installScriptedWorker, buildSegments, BASE_URL } from './harness';
@@ -39,11 +41,11 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
       };
     });
     expect(r.off).toBe('微生物學');
-    expect(r.on).toBe('Hypertension, Stroke, antigen, IgG. 微生物學');   // 核心名詞不重複、放在詞典其他名詞之後
-    expect(r.onlyDict).toBe('Hypertension, Stroke, antigen, IgG.');
+    expect(r.on).toBe('Hypertension, Stroke, antigen, IgG. 以下是微生物免疫學課程的繁體中文逐字稿。 微生物學');   // 核心名詞不重複、放在詞典其他名詞之後
+    expect(r.onlyDict).toBe('Hypertension, Stroke, antigen, IgG. 以下是微生物免疫學課程的繁體中文逐字稿。');
     expect(r.none).toBeNull();
     // 預設：核心名詞（使用者指定的免疫學／微生物學名詞）緊接在使用者提示詞之前 → 截斷時優先保留
-    expect(r.full.endsWith(r.core.join(', ') + '. 我的提示')).toBe(true);
+    expect(r.full.endsWith(r.core.join(', ') + '. 以下是微生物免疫學課程的繁體中文逐字稿。 我的提示')).toBe(true);   // 覆核 N2：詞彙表後接一句繁體中文
     for (const t of ['antigen', 'antibody', 'IgG', 'IgM', 'IgA', 'IgE', 'MHC class I', 'MHC class II', 'T cell', 'B cell', 'CD4', 'CD8', 'cytokine',
       'interleukin', 'complement', 'Gram-positive', 'Gram-negative', 'Staphylococcus aureus', 'Streptococcus', 'E. coli', 'Mycobacterium tuberculosis', 'endotoxin', 'virulence'])
       expect(r.core).toContain(t);
@@ -74,24 +76,54 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
     await ctx.close();
   });
 
-  test('P-03 stripPromptLeak：整段照抄提示詞（多個詞條連著）才移除；單獨講到某個醫學名詞不移除', async ({ browser }) => {
+  test('P-03 stripPromptLeak：長串照抄（≥8 個詞條連著）才移除；單獨或幾個醫學名詞、使用者提示詞裡的一句話都不移除', async ({ browser }) => {
     const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
     const r = await page.evaluate(() => {
       const T = (window as any).__t;
-      const prompt = 'Myocardial Infarction, Angina Pectoris, Atrial Fibrillation, Coronary Artery Disease, Hypertension. 本課程討論細菌、病毒、黴菌與免疫反應';
+      const prompt = 'Myocardial Infarction, Angina Pectoris, Atrial Fibrillation, Coronary Artery Disease, Hypertension, Stroke, Asthma, Diabetes, Sepsis, Anemia. 本課程討論細菌、病毒、黴菌與免疫反應';
       const w = (s: string) => s.split(/(?= )/).map((t) => ({ text: t, timestamp: [0, 1] }));
       const zh = (s: string) => [...s].map((t) => ({ text: t, timestamp: [0, 1] }));
-      const leakEn = [...w(' 今天 我們'), ...w(' Myocardial Infarction, Angina Pectoris, Atrial Fibrillation,'), ...w(' 開始 上課')];
-      const leakZh = [...zh('好'), ...zh('本課程討論細菌、病毒、黴菌與免疫反應'), ...zh('同學')];
+      const leakEn = [...w(' 今天 我們'), ...w(' Myocardial Infarction, Angina Pectoris, Atrial Fibrillation, Coronary Artery Disease, Hypertension, Stroke, Asthma, Diabetes,'), ...w(' 開始 上課')];
+      const three = [...w(' 今天 我們'), ...w(' Myocardial Infarction, Angina Pectoris, Atrial Fibrillation,'), ...w(' 開始 上課')];
+      const zhSent = [...zh('好'), ...zh('本課程討論細菌、病毒、黴菌與免疫反應'), ...zh('同學')];
       const single = [...w(' 這是 Hypertension 和 Coronary Artery Disease')];
-      const a = T.stripPromptLeak(leakEn, prompt), b = T.stripPromptLeak(leakZh, prompt), c = T.stripPromptLeak(single, prompt);
+      const a = T.stripPromptLeak(leakEn, prompt), t3 = T.stripPromptLeak(three, prompt), b = T.stripPromptLeak(zhSent, prompt), c = T.stripPromptLeak(single, prompt);
       const j = (x: any) => x.chunks.map((k: any) => k.text).join('');
-      return { a: j(a), ar: a.removed, b: j(b), br: b.removed, c: j(c), cr: c.removed, none: T.stripPromptLeak(single, null).removed };
+      return { a: j(a), ar: a.removed, t3: j(t3), t3r: t3.removed, b: j(b), br: b.removed, c: j(c), cr: c.removed, none: T.stripPromptLeak(single, null).removed };
     });
     expect(r.a).toBe(' 今天 我們 開始 上課'); expect(r.ar).toBeGreaterThan(0);
-    expect(r.b).toBe('好同學'); expect(r.br).toBe(18);
+    expect(r.t3).toBe(' 今天 我們 Myocardial Infarction, Angina Pectoris, Atrial Fibrillation, 開始 上課'); expect(r.t3r).toBe(0);
+    expect(r.b).toBe('好本課程討論細菌、病毒、黴菌與免疫反應同學'); expect(r.br).toBe(0);
     expect(r.c).toBe(' 這是 Hypertension 和 Coronary Artery Disease'); expect(r.cr).toBe(0);
     expect(r.none).toBe(0);
+    await ctx.close();
+  });
+
+  test('P-06 覆核 M1：老師照順序念的免疫／微生物名詞（真實預設提示詞）原樣保留；真的整份照抄、照抄開頭那句中文才移除', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const r = await page.evaluate(() => {
+      const T = (window as any).__t;
+      const prompt = T.composeWhisperPrompt('', T.DEFAULT_MEDICAL_DICT, true);          // 預設：詞典＋核心名詞＋中文開頭句
+      const promptU = T.composeWhisperPrompt('今天講第五章', T.DEFAULT_MEDICAL_DICT, true);
+      // Whisper 逐字輸出：中文一字一個 chunk、英文一詞一個 chunk（前面帶空白）
+      const toks = (s: string) => (s.match(/ ?[A-Za-z0-9α+\-.,]+|[^ A-Za-z0-9α+\-.,]/g) || []).map((t) => ({ text: t, timestamp: [0, 1] }));
+      const j = (x: any) => x.chunks.map((k: any) => k.text).join('');
+      const keep = ['抗體分成 IgG, IgM, IgA, IgE 四種', 'T cell, B cell, CD4, CD8', '金黃色葡萄球菌是 Gram-positive, coagulase-positive 的球菌',
+        '包括 CD4, CD8 T cell', 'antigen, antibody, IgG, IgM, IgA, IgE, MHC class I 都會考', 'cytokine, interleukin, complement'];
+      const kept = keep.map((t) => { const out: any = {}; for (const [k, P] of [['p', prompt], ['u', promptU]]) { const x = T.stripPromptLeak(toks(t), P); out[k] = { text: j(x), removed: x.removed }; } return { want: t, ...out }; });
+      const core = T.PROMPT_CORE_TERMS.join(', ');
+      const fullLeak = T.stripPromptLeak(toks('好 ' + core + '. 以下是微生物免疫學課程的繁體中文逐字稿。 同學'), prompt);
+      const segLeak = T.stripPromptLeak(toks(T.PROMPT_CORE_TERMS.slice(24, 30).join(', ')), prompt);   // 整段（≥95%）都是照抄的 6 個詞條
+      const leadLeak = T.stripPromptLeak(toks('以下是微生物免疫學課程的繁體中文逐字稿。 我們開始'), promptU);
+      return { kept, full: j(fullLeak), fullR: fullLeak.removed, seg: j(segLeak), segR: segLeak.removed, lead: j(leadLeak), leadR: leadLeak.removed };
+    });
+    for (const k of r.kept) {
+      expect(k.p.text.replace(/ /g, ''), k.want).toBe(k.want.replace(/ /g, '')); expect(k.p.removed, k.want).toBe(0);
+      expect(k.u.text.replace(/ /g, ''), k.want).toBe(k.want.replace(/ /g, '')); expect(k.u.removed, k.want).toBe(0);
+    }
+    expect(r.full.replace(/ /g, '')).toBe('好同學'); expect(r.fullR).toBeGreaterThan(20);
+    expect(r.seg).toBe(''); expect(r.segR).toBeGreaterThan(5);
+    expect(r.lead.replace(/ /g, '')).toBe('我們開始'); expect(r.leadR).toBeGreaterThan(0);
     await ctx.close();
   });
 
@@ -118,7 +150,7 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
       await run(null);
       await run('短提示');
       await run('LONG');
-      const P = '本課程討論細菌、病毒、黴菌與免疫反應';
+      const P = '本課程討論細菌、病毒、黴菌與免疫反應以及疫苗的作用';   // 整份提示詞（≥20 字）原樣照抄
       reply = { text: 'x', chunks: [{ text: '好', timestamp: [0, 1] }].concat(P.split('').map(function (c) { return { text: c, timestamp: [1, 2] }; })) };
       await run(P);
       self.postMessage = post;
@@ -136,7 +168,7 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
     expect(infos[0]).toMatchObject({ used: 3, total: 3, reason: null });
     expect(infos[1]).toMatchObject({ used: 200, total: 250 });
     const leak = out.find((m: any) => m.type === 'PROMPT_LEAK_REMOVED');
-    expect(leak?.payload.removed).toBe(18);
+    expect(leak?.payload.removed).toBe(25);
     const done = out.filter((m: any) => m.type === 'CHUNK_DONE');
     expect(done.at(-1).payload.result.chunks.map((c: any) => c.text).join('')).toBe('好');
     expect(done.at(-1).payload.result.text).toBe('好');
@@ -162,8 +194,8 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
     const p1 = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'RUN_CHUNK').map((x: any) => x.prompt));
     expect(p1.length).toBeGreaterThan(0);
     expect(p1[0]).toContain('Myocardial Infarction');
-    expect(p1[0]).toContain('Mycobacterium tuberculosis, endotoxin, virulence. 本課程是微生物與免疫學');
-    expect(p1[0].endsWith('. 本課程是微生物與免疫學')).toBe(true);
+    expect(p1[0]).toContain('Mycobacterium tuberculosis, endotoxin, virulence. 以下是微生物免疫學課程的繁體中文逐字稿。 本課程是微生物與免疫學');
+    expect(p1[0].endsWith('逐字稿。 本課程是微生物與免疫學')).toBe(true);
     expect(await page.locator('#logBox').textContent()).toContain('初始提示詞已啟用（你的提示詞＋免疫／微生物等醫學英文名詞）');
     await ctx.close();
   });
