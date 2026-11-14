@@ -6,7 +6,7 @@ import { test, expect, type Page } from '@playwright/test';
 import { newCtx, openWithHook, installScriptedWorker, buildSegments, BASE_URL } from './harness';
 import { setToggles } from './helpers';
 
-const NAMES = ['WORKER_CODE', 'spawnWorker', 'composeWhisperPrompt', 'buildPromptDecoderIds', 'stripPromptLeak', 'PROMPT_MAX_TOKENS', 'DEFAULT_MEDICAL_DICT'];
+const NAMES = ['PROMPT_CORE_TERMS', 'WORKER_CODE', 'spawnWorker', 'composeWhisperPrompt', 'buildPromptDecoderIds', 'stripPromptLeak', 'PROMPT_MAX_TOKENS', 'DEFAULT_MEDICAL_DICT'];
 
 /** 用頁面的 WORKER_CODE（真實 Worker 程式）＋測試尾段建立 Worker，等 T_OK／T_ERR。 */
 async function runInWorker(page: Page, body: string) {
@@ -21,24 +21,30 @@ async function runInWorker(page: Page, body: string) {
 }
 
 test.describe('r9 初始提示詞（decoder_input_ids）', () => {
-  test('P-01 composeWhisperPrompt：詞典開啟時英文名詞在前（去重）、使用者提示詞在最後；都沒有時回 null', async ({ browser }) => {
+  test('P-01 composeWhisperPrompt：詞典其他名詞在前（去重）→ 免疫／微生物核心名詞 → 使用者提示詞在最後；都沒有時回 null', async ({ browser }) => {
     const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
     const r = await page.evaluate(() => {
       const T = (window as any).__t;
-      const d = [{ en: 'Hypertension' }, { en: ' hypertension ' }, { en: 'Stroke' }, { en: '' }, {}];
+      const d = [{ en: 'Hypertension' }, { en: ' hypertension ' }, { en: 'Stroke' }, { en: 'antigen' }, { en: '' }, {}];
+      const core = ['antigen', 'IgG'];
       return {
-        off: T.composeWhisperPrompt('  微生物學  ', d, false),
-        on: T.composeWhisperPrompt('微生物學', d, true),
-        onlyDict: T.composeWhisperPrompt('', d, true),
-        none: T.composeWhisperPrompt('  ', d, false),
+        off: T.composeWhisperPrompt('  微生物學  ', d, false, core),
+        on: T.composeWhisperPrompt('微生物學', d, true, core),
+        onlyDict: T.composeWhisperPrompt('', d, true, core),
+        none: T.composeWhisperPrompt('  ', d, false, core),
         full: T.composeWhisperPrompt('我的提示', T.DEFAULT_MEDICAL_DICT, true),
+        core: T.PROMPT_CORE_TERMS,
       };
     });
     expect(r.off).toBe('微生物學');
-    expect(r.on).toBe('Hypertension, Stroke. 微生物學');
-    expect(r.onlyDict).toBe('Hypertension, Stroke.');
+    expect(r.on).toBe('Hypertension, Stroke, antigen, IgG. 微生物學');   // 核心名詞不重複、放在詞典其他名詞之後
+    expect(r.onlyDict).toBe('Hypertension, Stroke, antigen, IgG.');
     expect(r.none).toBeNull();
-    expect(r.full.endsWith('. 我的提示')).toBe(true);
+    // 預設：核心名詞（使用者指定的免疫學／微生物學名詞）緊接在使用者提示詞之前 → 截斷時優先保留
+    expect(r.full.endsWith(r.core.join(', ') + '. 我的提示')).toBe(true);
+    for (const t of ['antigen', 'antibody', 'IgG', 'IgM', 'IgA', 'IgE', 'MHC class I', 'MHC class II', 'T cell', 'B cell', 'CD4', 'CD8', 'cytokine',
+      'interleukin', 'complement', 'Gram-positive', 'Gram-negative', 'Staphylococcus aureus', 'Streptococcus', 'E. coli', 'Mycobacterium tuberculosis', 'endotoxin', 'virulence'])
+      expect(r.core).toContain(t);
     expect(r.full).toContain('Myocardial Infarction');
     await ctx.close();
   });
@@ -154,8 +160,9 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
     const p1 = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'RUN_CHUNK').map((x: any) => x.prompt));
     expect(p1.length).toBeGreaterThan(0);
     expect(p1[0]).toContain('Myocardial Infarction');
+    expect(p1[0]).toContain('Mycobacterium tuberculosis, endotoxin, virulence. 本課程是微生物與免疫學');
     expect(p1[0].endsWith('. 本課程是微生物與免疫學')).toBe(true);
-    expect(await page.locator('#logBox').textContent()).toContain('初始提示詞已啟用（你的提示詞＋醫學詞典英文名詞）');
+    expect(await page.locator('#logBox').textContent()).toContain('初始提示詞已啟用（你的提示詞＋免疫／微生物等醫學英文名詞）');
     await ctx.close();
   });
 });

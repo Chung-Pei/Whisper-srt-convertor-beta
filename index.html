@@ -1539,7 +1539,7 @@
       placeholder="輸入背景知識提升辨識準確率，例如：本音訊討論心臟外科手術、冠狀動脈繞道移植術、左心室射出分率。&#10;留空時不使用提示詞。"
       style="width:100%;resize:vertical;min-height:3rem;max-height:8rem;padding:0.55rem 0.75rem;background:var(--panel2);border:1px solid var(--border2);border-radius:var(--radius);color:var(--text);font-size:0.78rem;font-family:'IBM Plex Mono',monospace;line-height:1.5;"></textarea>
     <div style="font-size:0.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-top:0.3rem;">
-      提示詞會讓 Whisper 偏向辨識相關詞彙，適合會議、醫學、法律等專業場景。開啟下方「醫學專有名詞標注」時，詞典裡的英文醫學名詞也會一起提示給模型。
+      提示詞會讓 Whisper 偏向辨識相關詞彙，適合會議、醫學、法律等專業場景。開啟下方「醫學專有名詞標注」時，會一起提示免疫學、微生物學常用英文名詞（如 antibody、IgG、MHC、Staphylococcus aureus）與詞典裡的英文名詞。
     </div>
   </div>
 
@@ -1959,18 +1959,32 @@ async function importTransformers() {
 // 以下函式會以 toString() 原樣注入 Worker（不可引用外部變數、不可用反引號）。
 const PROMPT_MAX_TOKENS = 200;
 
-/** 組合送進模型的提示詞：醫學詞典英文名詞（開啟「醫學專有名詞標注」時）＋使用者提示詞。使用者提示詞放最後（截斷時優先保留）。 */
-function composeWhisperPrompt(userPrompt, dict, includeDict) {
+// 使用者指定（2026-11-14）：提示詞以「免疫學＋微生物學」名詞為主。這份清單一定放在詞典其他名詞之後、使用者提示詞之前，
+// 超過 200 token 截斷時（保留最後面）優先留下；越後面越重要。約 150 token，留空間給使用者提示詞。
+const PROMPT_CORE_TERMS = [
+  'innate immunity', 'adaptive immunity', 'macrophage', 'neutrophil', 'phagocytosis', 'antigen-presenting cell', 'interferon', 'TNF-α',
+  'vaccine', 'pathogen', 'exotoxin', 'lipopolysaccharide', 'peptidoglycan', 'Candida albicans', 'HIV', 'hepatitis B virus',
+  'antigen', 'antibody', 'IgG', 'IgM', 'IgA', 'IgE', 'MHC class I', 'MHC class II', 'T cell', 'B cell', 'CD4', 'CD8',
+  'cytokine', 'interleukin', 'complement', 'Gram-positive', 'Gram-negative', 'Staphylococcus aureus', 'Streptococcus',
+  'E. coli', 'Mycobacterium tuberculosis', 'endotoxin', 'virulence',
+];
+
+/** 組合送進模型的提示詞（開啟「醫學專有名詞標注」時加入名詞）：
+ *  [詞典其他英文名詞] → [免疫學／微生物學核心名詞 PROMPT_CORE_TERMS] → [使用者提示詞]。
+ *  Worker 超過 200 token 時保留最後面，所以依序優先留下：使用者提示詞 ＞ 免疫微生物核心名詞 ＞ 詞典其他名詞。 */
+function composeWhisperPrompt(userPrompt, dict, includeDict, coreTerms) {
   const user = String(userPrompt || '').trim();
   let glossary = '';
-  if (includeDict && Array.isArray(dict)) {
-    const seen = new Set(); const terms = [];
-    for (const e of dict) {
+  if (includeDict) {
+    const core = Array.isArray(coreTerms) ? coreTerms : (typeof PROMPT_CORE_TERMS !== 'undefined' ? PROMPT_CORE_TERMS : []);
+    const seen = new Set(core.map((t) => String(t).trim().toLowerCase()));
+    const rest = [];
+    for (const e of (Array.isArray(dict) ? dict : [])) {
       const t = String((e && e.en) || '').trim();
       const k = t.toLowerCase();
-      if (t && !seen.has(k)) { seen.add(k); terms.push(t); }
+      if (t && !seen.has(k)) { seen.add(k); rest.push(t); }
     }
-    glossary = terms.join(', ');
+    glossary = rest.concat(core.map((t) => String(t).trim()).filter(Boolean)).join(', ');
   }
   const parts = [];
   if (glossary) parts.push(glossary + '.');
@@ -5181,7 +5195,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     const useDictInPrompt = !!document.getElementById('tog_medical')?.checked;
     const promptText = composeWhisperPrompt(userPrompt, medicalDict, useDictInPrompt);
     _promptInfoLogged = false;
-    if (promptText) log(`💬 初始提示詞已啟用（${[userPrompt ? '你的提示詞' : '', useDictInPrompt ? '醫學詞典英文名詞' : ''].filter(Boolean).join('＋')}）`, 'info');
+    if (promptText) log(`💬 初始提示詞已啟用（${[userPrompt ? '你的提示詞' : '', useDictInPrompt ? '免疫／微生物等醫學英文名詞' : ''].filter(Boolean).join('＋')}）`, 'info');
     const CHUNK_SEC  = 30;
     const STRIDE_SEC = 5;
     const totalSamples = audio instanceof Float32Array ? audio.length : audio.totalSamples;
