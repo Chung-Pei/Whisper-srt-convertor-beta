@@ -1958,33 +1958,113 @@ let ModelRegistry = null;   // v4 新增
 let envRef        = null;
 let pipe          = null;
 let modelFolderHandle = null;
+let _folderBypass = false;   // r9-fix：上次載入發現檔案損壞 → 本次不讀資料夾內的舊檔，重新下載並覆寫
+
+// ── r9-fix：損壞模型檔防護 ─────────────────────────────────────────────
+// 使用者回報（55 分鐘影片＋whisper-base）：一開始就出現 JSON 解析錯誤被誤判為顯示卡失敗，接著 getReader of null。
+// 根因：(1) 模型資料夾攔截器把 transformers.js 的「只取第 1 個位元組」Range 請求（206，內容只有 "{"）當成完整檔寫入資料夾，
+//      下次讀到只有 "{" 的 config.json；該回應又被 transformers.js 存進瀏覽器快取 → 毀損持續存在；
+// (2) 下載中斷時資料夾留下 0 位元組空檔，再被存進瀏覽器快取；Cache Storage 對空內容回傳 body=null → readResponse 的 getReader 崩潰。
+// 修法：攔截器不寫入 Range／非 GET；讀取時檢查空檔與 JSON；瀏覽器快取外包一層檢查（損壞自動刪除、不存入壞資料）；
+//      仍失敗時 Worker 回報 MODEL_FILE_CORRUPT（不再當成 GPU 失敗），主執行緒清除後重新下載一次。
+const MODEL_FILE_CORRUPT_RE = /in JSON at position|Unexpected (token|end of JSON)|is not valid JSON|JSON\\.parse|getReader|reading 'body'|Unable to get model file/i;
+// 覆核 r1-S1：protobuf parsing failed 不列入（大模型可能是 2 GB 上限或記憶體不足，不是損壞；不應清掉數 GB 重下）。
+const MODEL_CACHE_NAME = 'transformers-cache';
+function _isJsonName(p) { return /\\.json(\\?|$)/i.test(String(p)); }
+function _shortName(u) { try { return decodeURIComponent(String(u).split('?')[0].split('/').pop()); } catch (_) { return String(u); } }
+function _reportRepair(file, why) { self.postMessage({ type: 'CACHE_REPAIRED', payload: { file: file, why: why } }); }
+
+/** 回傳毛病描述（字串）或 null。只對小的 JSON 讀內容；大型 .onnx 只看是否為空。 */
+async function _entryProblem(url, resp) {
+  if (!resp) return null;
+  if (resp.status !== 200) return '狀態異常（' + resp.status + '）';
+  if (resp.body === null || resp.headers.get('content-length') === '0') return '內容是空的';
+  if (_isJsonName(url)) {
+    try { const t = await resp.clone().text(); if (!t.trim()) return '內容是空的'; JSON.parse(t); }
+    catch (_) { return '內容不完整或損壞'; }
+  }
+  return null;
+}
+
+let _realCacheP = null;
+function _realCache() { if (!_realCacheP) _realCacheP = caches.open(MODEL_CACHE_NAME); return _realCacheP; }
+/** 包住瀏覽器快取：讀到壞的就刪掉並當成沒有（transformers.js 會重新下載）；壞的不寫入。 */
+const guardedCache = {
+  async match(key, opts) {
+    let c; try { c = await _realCache(); } catch (_) { return undefined; }
+    const r = await c.match(key, opts);
+    if (!r) return undefined;
+    const url = typeof key === 'string' ? key : key.url;
+    const bad = await _entryProblem(url, r);
+    if (bad) { try { await c.delete(key); } catch (_) {} _reportRepair(_shortName(url), bad); return undefined; }
+    return r;
+  },
+  async put(key, resp) {
+    const url = typeof key === 'string' ? key : key.url;
+    if (await _entryProblem(url, resp)) return;
+    const c = await _realCache();
+    return c.put(key, resp);
+  },
+  async delete(key) { const c = await _realCache(); return c.delete(key); },
+};
+
+/** 刪除瀏覽器快取中此模型的所有檔案（下次載入時重新下載）。回傳刪除數。 */
+async function _purgeModelCache(modelId) {
+  let n = 0;
+  try {
+    const c = await _realCache();
+    for (const req of await c.keys()) {
+      if (req.url.indexOf('/' + modelId + '/') >= 0) { if (await c.delete(req)) n++; }
+    }
+  } catch (_) {}
+  return n;
+}
+
+async function _folderDirAndName(relativePath, create) {
+  // 【安全修復】：過濾 '..' 路徑片段，防止目錄遍歷攻擊
+  const parts = relativePath.split('/').filter(p => p && p !== '..' && p !== '.');
+  if (parts.length === 0) return null;
+  let dir = modelFolderHandle;
+  for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: create });
+  return { dir: dir, name: parts[parts.length - 1] };
+}
 
 async function readFromModelFolder(relativePath) {
   if (!modelFolderHandle) return null;
   try {
-    // 【安全修復】：過濾 '..' 路徑片段，防止目錄遍歷攻擊
-    const parts = relativePath.split('/').filter(p => p && p !== '..' && p !== '.');
-    if (parts.length === 0) return null;
-    let dir = modelFolderHandle;
-    for (let i = 0; i < parts.length - 1; i++) {
-      dir = await dir.getDirectoryHandle(parts[i], { create: false });
+    const loc = await _folderDirAndName(relativePath, false);
+    if (!loc) return null;
+    const fh = await loc.dir.getFileHandle(loc.name, { create: false });
+    const file = await fh.getFile();
+    let bad = file.size === 0 ? '內容是空的' : null;
+    if (!bad && _isJsonName(loc.name)) {
+      try { JSON.parse(await file.text()); } catch (_) { bad = '內容不完整或損壞'; }
     }
-    const fh = await dir.getFileHandle(parts[parts.length - 1], { create: false });
-    return await fh.getFile();
+    if (bad) {
+      try { await loc.dir.removeEntry(loc.name); } catch (_) {}
+      _reportRepair(loc.name + '（模型資料夾）', bad);
+      return null;
+    }
+    return file;
   } catch { return null; }
 }
 
 async function writeToModelFolder(relativePath, responseClone) {
   if (!modelFolderHandle) return;
+  let loc = null;
   try {
-    // 【安全修復】：過濾 '..' 路徑片段，防止目錄遍歷攻擊
-    const parts = relativePath.split('/').filter(p => p && p !== '..' && p !== '.');
-    if (parts.length === 0) return;
-    let dir = modelFolderHandle;
-    for (let i = 0; i < parts.length - 1; i++) {
-      dir = await dir.getDirectoryHandle(parts[i], { create: true });
+    loc = await _folderDirAndName(relativePath, true);
+    if (!loc) return;
+    const dir = loc.dir;
+    // r9-fix：JSON 先完整讀出並驗證，壞的不寫（避免留下只有 "{" 的檔案）
+    if (_isJsonName(loc.name)) {
+      const text = await responseClone.text();
+      JSON.parse(text);
+      const w = await (await dir.getFileHandle(loc.name, { create: true })).createWritable();
+      try { await w.write(text); await w.close(); } catch (err) { await w.abort().catch(() => {}); throw err; }
+      return;
     }
-    const fh = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+    const fh = await dir.getFileHandle(loc.name, { create: true });
     const writer = await fh.createWritable();
 
     if (responseClone.body) {
@@ -2006,6 +2086,8 @@ async function writeToModelFolder(relativePath, responseClone) {
       }
     }
   } catch (e) {
+    // r9-fix：寫入失敗不留下 0 位元組或不完整的檔案（下次會被當成模型檔讀取）
+    if (loc) { try { await loc.dir.removeEntry(loc.name); } catch (_) {} }
     self.postMessage({ type: 'PROGRESS', payload: { status: 'initiate', file: '(寫入資料夾失敗, 將快取於 IndexedDB)' } });
   }
 }
@@ -2023,7 +2105,26 @@ function installFolderFetchInterceptor() {
       const rawPath = urlObj.pathname.slice(1);
       const localPath = rawPath.replace('/resolve/main/', '/');
 
-      const fileObj = await readFromModelFolder(localPath);
+      // r9-fix：transformers.js 會用「Range: bytes=0-0」只取 1 個位元組來查檔案大小。
+      // 這類請求絕不可寫入資料夾（原本會把只有 "{" 的內容存成 config.json）；有本機檔時回傳正確的 206 片段。
+      const method = String((init && init.method) || (resource instanceof Request ? resource.method : 'GET')).toUpperCase();
+      const hdrs = new Headers((init && init.headers) || (resource instanceof Request ? resource.headers : undefined));
+      const range = hdrs.get('range');
+      if (method !== 'GET' || range) {
+        const m = method === 'GET' && !_folderBypass ? /^bytes=(\\d+)-(\\d*)$/.exec(String(range).trim()) : null;
+        const local = m ? await readFromModelFolder(localPath) : null;
+        if (local) {
+          const a = Number(m[1]), b = m[2] === '' ? local.size - 1 : Math.min(Number(m[2]), local.size - 1);
+          if (a <= b) {
+            return new Response(local.slice(a, b + 1), { status: 206, headers: {
+              'Content-Type': 'application/octet-stream', 'Content-Length': String(b - a + 1),
+              'Content-Range': 'bytes ' + a + '-' + b + '/' + local.size } });
+          }
+        }
+        return self._originalFetch(resource, init);
+      }
+
+      const fileObj = _folderBypass ? null : await readFromModelFolder(localPath);
       if (fileObj !== null) {
         self.postMessage({ type: 'PROGRESS', payload: { status: 'initiate', file: '📁 載入本地: ' + localPath.split('/').pop() } });
         return new Response(fileObj, {
@@ -2034,7 +2135,7 @@ function installFolderFetchInterceptor() {
 
       self.postMessage({ type: 'PROGRESS', payload: { status: 'initiate', file: '⬇ 下載並存入資料夾: ' + localPath.split('/').pop() } });
       const resp = await self._originalFetch(resource, init);
-      if (resp.ok) {
+      if (resp.status === 200 && resp.body) {
         const clone = resp.clone();
         writeToModelFolder(localPath, clone).catch(() => {});
       }
@@ -2055,6 +2156,9 @@ async function loadLib() {
   if (envRef) {
     envRef.allowLocalModels = false;
     envRef.useBrowserCache  = true;
+    // r9-fix：經過檢查的快取（損壞自動刪除重抓）；fetch 一律走目前的 self.fetch（之後才選資料夾也會經過攔截器）
+    if (typeof caches !== 'undefined') { envRef.useCustomCache = true; envRef.customCache = guardedCache; }
+    envRef.fetch = (u, i) => self.fetch(u, i);
   }
 }
 
@@ -2103,6 +2207,7 @@ self.addEventListener('message', async (e) => {
         modelFolderHandle = payload.modelFolderHandle;
         installFolderFetchInterceptor();
       }
+      _folderBypass = !!payload.bypassFolder;
 
       await loadLib();
 
@@ -2142,6 +2247,13 @@ self.addEventListener('message', async (e) => {
       try {
         pipe = await pipelineFn('automatic-speech-recognition', payload.modelId, { dtype, device, progress_callback });
       } catch (gpuErr) {
+        // r9-fix：模型檔內容損壞（JSON 解析失敗、空內容）與顯示卡無關，不可降級成一般模式。
+        // 先清掉瀏覽器快取裡這個模型的檔案，回報 MODEL_FILE_CORRUPT，由主執行緒換新 Worker 重新下載一次。
+        const em = String(gpuErr && gpuErr.message || gpuErr);
+        if (MODEL_FILE_CORRUPT_RE.test(em)) {
+          await _purgeModelCache(payload.modelId);
+          throw new Error('MODEL_FILE_CORRUPT: ' + em);
+        }
         // v24 r8：原本只有 requestAdapter() 失敗才降級；adapter 拿得到、但建立 WebGPU session 失敗
         // （不支援的運算子、shader 編譯失敗、GPU 記憶體不足、requestDevice 被拒）會讓整個檔案失敗。
         // 不在同一個 Worker 內改用 WASM 重試：失敗前可能已建好部分 session（GPU buffer、已複製進 WASM heap 的權重），
@@ -2152,7 +2264,7 @@ self.addEventListener('message', async (e) => {
         const gm = String(gpuErr && gpuErr.message || gpuErr);
         // 覆核 r2：只認「明確的網路／讀檔」字樣；不可用 storage／abort／not found 等寬鬆字，
         // 否則 'maximum storage buffer binding size'、'Device lost: aborted'、'Kernel not found' 等真正的 GPU 錯誤會被誤放行。
-        if (/failed to fetch|fetch failed|networkerror|network error|net::ERR_|ERR_INTERNET|offline|\bHTTP\s*(4|5)\d\d\b|\b404\b|could not locate file|unauthorized|ENOENT|QuotaExceededError/i.test(gm)) throw gpuErr;
+        if (/failed to fetch|fetch failed|networkerror|network error|net::ERR_|ERR_INTERNET|offline|\\bHTTP\\s*(4|5)\\d\\d\\b|\\b404\\b|could not locate file|unauthorized|ENOENT|QuotaExceededError/i.test(gm)) throw gpuErr;
         throw new Error('GPU_LOAD_FAILED: ' + gm);
       }
       self.postMessage({ type: 'MODEL_READY', payload: { device } });
@@ -2252,6 +2364,10 @@ function createWorker() {
     workerReady = false;
   }
   inferenceWorker = spawnWorker(WORKER_CODE);
+  // r9-fix：Worker 發現並刪除損壞的暫存模型檔時，用白話記一筆（之後會自動重新下載該檔）
+  inferenceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'CACHE_REPAIRED') log(`⚠ 發現損壞的模型暫存檔「${e.data.payload?.file ?? ''}」（${e.data.payload?.why ?? ''}），已刪除並重新下載`, 'warn');
+  });
   // 主執行緒側攔截 Worker 未捕獲錯誤，轉為 UI log 而非 console Uncaught Error
   inferenceWorker.onerror = (e) => {
     e.preventDefault(); // 阻止冒泡至 window.onerror
@@ -2488,23 +2604,52 @@ function runChunkOnWorker(worker, base, audioCopy, timeoutMs = CHUNK_TIMEOUT_MS)
 }
 
 const GPU_LOAD_FAILED = 'GPU_LOAD_FAILED: ';
+const MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT: ';
+const MODEL_CORRUPT_USER_MSG = '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
+  + '請確認網路穩定後重新整理頁面再試；若仍失敗，可先改選其他模型，或在瀏覽器設定中清除本網站的資料後再試。';
+const MODEL_LOAD_FAILED_USER_MSG = '這個模型無法載入：可能是模型太大，或電腦記憶體不夠。請改選較小的模型（base 或 small）再試。';
+/** 覆核 r1-S3：有選「模型資料夾」時，清除網站資料不會刪到資料夾裡的檔案 → 改提示刪除資料夾內該模型的子資料夾。 */
+function modelCorruptUserMsg(modelId = "") {
+  if (!modelFolderHandle) return MODEL_CORRUPT_USER_MSG;
+  return '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
+    + `請確認網路穩定後重新整理頁面再試；若仍失敗，請刪除模型資料夾裡的「${[modelFolderHandle.name, ...String(modelId).split('/').filter(Boolean)].join(' › ')}」這個子資料夾後再試，`
+    + '或按模型資料夾旁的「清除」（只是不再使用資料夾，不會刪檔）、改選其他模型。';
+}
 /** 送 LOAD_MODEL 並等 MODEL_READY；回傳實際載入模型的 Worker。
  *  v24 r8：WebGPU 建 session 失敗（Worker 回 GPU_LOAD_FAILED）→ 記下該模型不再用 GPU、終止這個 Worker
- *  （唯一能真正釋放 WASM heap 與 GPU buffer 的方法）、建新 Worker 以 WASM 重載。onMsg 會跟著搬到新 Worker。 */
+ *  （唯一能真正釋放 WASM heap 與 GPU buffer 的方法）、建新 Worker 以 WASM 重載。onMsg 會跟著搬到新 Worker。
+ *  r9-fix：模型檔損壞（MODEL_FILE_CORRUPT，Worker 已清除快取）→ 不算 GPU 失敗；換新 Worker、略過資料夾舊檔，重新下載一次。 */
 async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null) {
-  try {
-    await workerCall(worker, 'LOAD_MODEL', buildLoadModelPayload(modelId, dtype, opts), 'MODEL_READY', 600000);
-    return worker;
-  } catch (err) {
-    const m = String(err?.message ?? err);
-    if (!m.startsWith(GPU_LOAD_FAILED)) throw err;
-    markGpuFailed(modelId, m.slice(GPU_LOAD_FAILED.length));
-    if (onMsg) worker.removeEventListener('message', onMsg);
-    const w = createWorker();                        // 終止舊 Worker 並建立新的（inferenceWorker 隨之更新）
-    if (onMsg) w.addEventListener('message', onMsg);
-    await workerCall(w, 'LOAD_MODEL', buildLoadModelPayload(modelId, dtype, { ...opts, preferGpu: false }), 'MODEL_READY', 600000);
-    return w;
+  let w = worker, o = { ...opts }, repaired = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await workerCall(w, 'LOAD_MODEL', buildLoadModelPayload(modelId, dtype, o), 'MODEL_READY', 600000);
+      return w;
+    } catch (err) {
+      const m = String(err?.message ?? err);
+      if (m.startsWith(MODEL_FILE_CORRUPT)) {
+        if (repaired) throw new Error(modelCorruptUserMsg(modelId));   // 覆核 r2-R2-2：技術細節第一次已記過，不重複
+        repaired = true;
+        log('⚠ 電腦裡暫存的模型檔有損壞（可能是之前下載中斷），已自動清除，正在重新下載…', 'warn');
+        log(`（技術細節，供回報問題用：${m.slice(MODEL_FILE_CORRUPT.length)}）`, 'info');
+        o = { ...o, bypassFolder: true };
+      } else if (m.startsWith(GPU_LOAD_FAILED) && o.preferGpu !== false) {
+        markGpuFailed(modelId, m.slice(GPU_LOAD_FAILED.length));
+        o = { ...o, preferGpu: false };
+      } else {
+        // 覆核 r2-R2-1：模型無法解析／載入（多半是模型太大或記憶體不足）→ 白話說明＋下一步，原始訊息另記一行
+        if (/protobuf|from blob failed/i.test(m)) {
+          log(`（技術細節，供回報問題用：${m}）`, 'info');
+          throw new Error(MODEL_LOAD_FAILED_USER_MSG);
+        }
+        throw err;
+      }
+      if (onMsg) w.removeEventListener('message', onMsg);
+      w = createWorker();                            // 終止舊 Worker 並建立新的（inferenceWorker 隨之更新）
+      if (onMsg) w.addEventListener('message', onMsg);
+    }
   }
+  throw new Error(modelCorruptUserMsg(modelId));
 }
 
 /** 失敗後重建 Worker 並重載模型。oom／crash：WebGPU 後端 → 改用 WASM（Worker 對 WebGPU 固定用 enc:fp16/dec:q4 或 fp32，忽略 dtype）；
@@ -2698,6 +2843,7 @@ function buildLoadModelPayload(modelId, dtype, opts = {}) {
     dtype,
     preferGpu: opts.preferGpu ?? defaultPreferGpu(modelId),
     modelFolderHandle: modelFolderHandle ?? null,
+    bypassFolder: !!opts.bypassFolder,
   };
 }
 
