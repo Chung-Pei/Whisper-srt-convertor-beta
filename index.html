@@ -2607,11 +2607,13 @@ const GPU_LOAD_FAILED = 'GPU_LOAD_FAILED: ';
 const MODEL_FILE_CORRUPT = 'MODEL_FILE_CORRUPT: ';
 const MODEL_CORRUPT_USER_MSG = '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
   + '請確認網路穩定後重新整理頁面再試；若仍失敗，可先改選其他模型，或在瀏覽器設定中清除本網站的資料後再試。';
+const MODEL_LOAD_FAILED_USER_MSG = '這個模型無法載入：可能是模型太大，或電腦記憶體不夠。請改選較小的模型（base 或 small）再試。';
 /** 覆核 r1-S3：有選「模型資料夾」時，清除網站資料不會刪到資料夾裡的檔案 → 改提示刪除資料夾內該模型的子資料夾。 */
-function modelCorruptUserMsg() {
+function modelCorruptUserMsg(modelId = "") {
   if (!modelFolderHandle) return MODEL_CORRUPT_USER_MSG;
   return '模型檔案無法正確讀取：已自動清除損壞的暫存檔並重新下載一次，仍然失敗。'
-    + `請確認網路穩定後重新整理頁面再試；若仍失敗，請打開你選的模型資料夾「${modelFolderHandle.name}」，刪除這個模型的子資料夾後再試，或先取消模型資料夾、改選其他模型。`;
+    + `請確認網路穩定後重新整理頁面再試；若仍失敗，請刪除模型資料夾裡的「${[modelFolderHandle.name, ...String(modelId).split('/').filter(Boolean)].join(' › ')}」這個子資料夾後再試，`
+    + '或按模型資料夾旁的「清除」（只是不再使用資料夾，不會刪檔）、改選其他模型。';
 }
 /** 送 LOAD_MODEL 並等 MODEL_READY；回傳實際載入模型的 Worker。
  *  v24 r8：WebGPU 建 session 失敗（Worker 回 GPU_LOAD_FAILED）→ 記下該模型不再用 GPU、終止這個 Worker
@@ -2626,10 +2628,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
     } catch (err) {
       const m = String(err?.message ?? err);
       if (m.startsWith(MODEL_FILE_CORRUPT)) {
-        if (repaired) {
-          log(`（技術細節，供回報問題用：${m.slice(MODEL_FILE_CORRUPT.length)}）`, 'info');
-          throw new Error(modelCorruptUserMsg());
-        }
+        if (repaired) throw new Error(modelCorruptUserMsg(modelId));   // 覆核 r2-R2-2：技術細節第一次已記過，不重複
         repaired = true;
         log('⚠ 電腦裡暫存的模型檔有損壞（可能是之前下載中斷），已自動清除，正在重新下載…', 'warn');
         log(`（技術細節，供回報問題用：${m.slice(MODEL_FILE_CORRUPT.length)}）`, 'info');
@@ -2638,6 +2637,11 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
         markGpuFailed(modelId, m.slice(GPU_LOAD_FAILED.length));
         o = { ...o, preferGpu: false };
       } else {
+        // 覆核 r2-R2-1：模型無法解析／載入（多半是模型太大或記憶體不足）→ 白話說明＋下一步，原始訊息另記一行
+        if (/protobuf|from blob failed/i.test(m)) {
+          log(`（技術細節，供回報問題用：${m}）`, 'info');
+          throw new Error(MODEL_LOAD_FAILED_USER_MSG);
+        }
         throw err;
       }
       if (onMsg) w.removeEventListener('message', onMsg);
@@ -2645,7 +2649,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
       if (onMsg) w.addEventListener('message', onMsg);
     }
   }
-  throw new Error(modelCorruptUserMsg());
+  throw new Error(modelCorruptUserMsg(modelId));
 }
 
 /** 失敗後重建 Worker 並重載模型。oom／crash：WebGPU 後端 → 改用 WASM（Worker 對 WebGPU 固定用 enc:fp16/dec:q4 或 fp32，忽略 dtype）；

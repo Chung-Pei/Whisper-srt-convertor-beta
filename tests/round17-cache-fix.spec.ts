@@ -223,7 +223,7 @@ test('CF-04b 最終錯誤：畫面訊息不夾技術細節（只寫在紀錄的�
   const r = await corruptLoad(page, "Expected property name or '}' in JSON at position 1 (line 1 column 2)", 2);
   expect(r.log).toContain('模型檔案無法正確讀取');
   expect(r.log).not.toContain('（技術細節：');
-  expect(r.log).toContain('技術細節，供回報問題用');
+  expect(r.log!.split('技術細節，供回報問題用').length - 1).toBe(1);   // 覆核 r2-R2-2：不重複記錄
 });
 
 test('CF-05 protobuf parsing failed（大模型可能是記憶體／2 GB 上限）→ 不當成檔案損壞、不清掉已下載的模型', async ({ page }) => {
@@ -237,5 +237,15 @@ test('CF-06 有選模型資料夾時，最終錯誤提示刪除資料夾內該�
   test.setTimeout(120_000);
   const r = await corruptLoad(page, "Expected property name or '}' in JSON at position 1 (line 1 column 2)", 2, true);
   expect(r.log).toContain('模型檔案無法正確讀取');
-  expect(r.log).toContain('刪除這個模型的子資料夾');
+  expect(r.log).toMatch(/刪除模型資料夾裡的「我的模型 › \S+/);
+  expect(r.log).toContain('不會刪檔');
+});
+
+test('CF-07 protobuf 錯誤在一般模式仍失敗 → 白話說明（模型太大或記憶體不夠，改選較小模型），原始英文只在「供回報問題用」', async ({ page }) => {
+  test.setTimeout(120_000);
+  const r = await corruptLoad(page, 'Load model from blob failed: protobuf parsing failed.', 2);
+  expect(r.log).toContain('這個模型無法載入');
+  expect(r.log).toContain('改選較小的模型');
+  expect(r.log).not.toContain('錯誤：Load model from blob failed');
+  expect(r.log).toContain('技術細節，供回報問題用：Load model from blob failed');
 });
