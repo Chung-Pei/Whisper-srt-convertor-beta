@@ -90,6 +90,7 @@ export async function buildSegments(ctx: BrowserContext, spec: CorpusSpec): Prom
 
 // ── 假 Whisper Worker（可編排；依主程式實際協定回覆）──────────────────────────────
 export type Rule = { segIdx: number; attempt?: number; silent?: boolean; crash?: string;
+  pre?: any[];   // r9：CHUNK_DONE 之前先送出的訊息（例如 PROMPT_LEAK_REMOVED）
   reply?: { type: 'CHUNK_ERROR'; error: string } | { type: 'ERROR'; payload: string } };
 
 export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
@@ -126,6 +127,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
             return;
           }
           setTimeout(() => {
+            for (const m of (rule?.pre ?? [])) this.emit({ type: m.type, payload: { ...(m.payload || {}), segIdx: p.segIdx, startSec: p.startSec } });
             if (rule?.reply?.type === 'CHUNK_ERROR') this.emit({ type: 'CHUNK_ERROR', payload: { error: rule.reply.error, segIdx: p.segIdx } });
             else if (rule?.reply?.type === 'ERROR') this.emit({ type: 'ERROR', payload: rule.reply.payload });
             else this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: segments[p.segIdx % segments.length] }, segIdx: p.segIdx, startSec: p.startSec, strideSec: p.strideSec } });

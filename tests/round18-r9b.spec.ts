@@ -201,6 +201,38 @@ test.describe('r9 初始提示詞（decoder_input_ids）', () => {
   });
 });
 
+test.describe('r9 覆核第 1 輪：畫面', () => {
+  test('P-07 覆核 N12／N11：照抄提示詞被移除 → 完成畫面白話說明段數與字詞數（不只日誌）；提示詞說明主畫面一句、細節收在「？」', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    const segs = await buildSegments(ctx, { segments: 3, linesPerSegment: 2, charsPerLine: 10, termRate: 0.1, seed: 7 });
+    await installScriptedWorker(page, { segments: segs, rules: [
+      { segIdx: 0, pre: [{ type: 'PROMPT_LEAK_REMOVED', payload: { removed: 30 } }] },
+      { segIdx: 1, pre: [{ type: 'PROMPT_LEAK_REMOVED', payload: { removed: 12 } }] },
+    ] });
+    await page.goto(BASE_URL);
+    // 說明：主畫面只有一句，細節預設收起
+    await expect(page.locator('#promptHelp')).toContainText('寫幾個這堂課會講到的詞');
+    await expect(page.locator('#promptHelpMore')).not.toHaveAttribute('open', '');
+    await expect(page.locator('#promptHelpMore > div')).toBeHidden();
+    await page.locator('#promptHelpMore > summary').click();
+    await expect(page.locator('#promptHelpMore > div')).toBeVisible();
+    await expect(page.locator('#promptHelpMore > div')).toContainText('免疫學、微生物學');
+    await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+    await page.locator('#initialPrompt').fill('今天講 MHC');
+    await setToggles(page, ['tog_medical'], ['tog_vad', 'tog_uvr']);
+    const n = 16000 * 65, b = Buffer.alloc(44 + n * 2); b.write('RIFF', 0); b.writeUInt32LE(36 + n * 2, 4); b.write('WAVEfmt ', 8); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(16000, 24); b.writeUInt32LE(32000, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(n * 2, 40); for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(8000 * Math.sin(i / 10)), 44 + i * 2);
+    await page.locator('#fileInput').setInputFiles({ name: 'lec.wav', mimeType: 'audio/wav', buffer: b });
+    await page.locator('#startBtn').click();
+    await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+    const notice = page.locator('#uvrNotice');
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText('「lec.wav」：有 2 處是模型把提示詞原文照抄進字幕，已自動刪除（共 42 個字詞）');
+    await expect(page.locator('#logBox')).toContainText('第 1 段，約 00:00:00 起：模型把提示詞原文照抄進字幕，已自動移除（30 個字詞）');
+    await ctx.close();
+  });
+});
+
 // ── 離線權重預檢 ────────────────────────────────────────────────────
 const WAV8 = (() => { const n = 16000 * 8, b = Buffer.alloc(44 + n * 2); b.write('RIFF', 0); b.writeUInt32LE(36 + n * 2, 4); b.write('WAVEfmt ', 8); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(16000, 24); b.writeUInt32LE(32000, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34); b.write('data', 36); b.writeUInt32LE(n * 2, 40); for (let i = 0; i < n; i++) b.writeInt16LE(Math.round(8000 * Math.sin(i / 10)), 44 + i * 2); return b; })();
 const M = 'Xenova/whisper-base';

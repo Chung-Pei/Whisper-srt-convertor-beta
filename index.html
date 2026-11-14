@@ -336,6 +336,11 @@
 
   .drop-icon { font-size: 2.5rem; margin-bottom: 0.75rem; opacity: 0.6; }
   .drop-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.3rem; }
+  /* r9 覆核 N11：小問號說明（預設收起，主畫面只留一句） */
+  .mini-help { display: inline; }
+  .mini-help > summary { display: inline-flex; align-items: center; justify-content: center; width: 1.1rem; height: 1.1rem; margin-left: 0.25rem; border: 1px solid var(--border2); border-radius: 50%; cursor: pointer; list-style: none; font-size: 0.65rem; line-height: 1; vertical-align: middle; }
+  .mini-help > summary::-webkit-details-marker { display: none; }
+  .mini-help[open] > div { display: block; margin-top: 0.3rem; padding: 0.4rem 0.6rem; background: var(--panel2); border-radius: var(--radius); }
   .drop-hint { font-size: 0.78rem; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
 
   .options-row {
@@ -1536,10 +1541,14 @@
       <span style="font-size:0.7rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-weight:400;">選填</span>
     </label>
     <textarea id="initialPrompt" rows="2"
-      placeholder="輸入背景知識提升辨識準確率，例如：本音訊討論心臟外科手術、冠狀動脈繞道移植術、左心室射出分率。&#10;留空時不使用提示詞。"
+      placeholder="例如：今天講 MHC、T 細胞活化、細胞激素（可留空）"
       style="width:100%;resize:vertical;min-height:3rem;max-height:8rem;padding:0.55rem 0.75rem;background:var(--panel2);border:1px solid var(--border2);border-radius:var(--radius);color:var(--text);font-size:0.78rem;font-family:'IBM Plex Mono',monospace;line-height:1.5;"></textarea>
-    <div style="font-size:0.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-top:0.3rem;">
-      提示詞會讓 Whisper 偏向辨識相關詞彙，適合會議、醫學、法律等專業場景。開啟下方「醫學專有名詞標注」時，會一起提示免疫學、微生物學常用英文名詞（如 antibody、IgG、MHC、Staphylococcus aureus）與詞典裡的英文名詞。
+    <div id="promptHelp" style="font-size:0.68rem;color:var(--muted);font-family:'IBM Plex Mono',monospace;margin-top:0.3rem;">
+      寫幾個這堂課會講到的詞，辨識會更準。
+      <details id="promptHelpMore" class="mini-help">
+        <summary aria-label="提示詞的更多說明">？</summary>
+        <div>開啟下方「醫學專有名詞標注」時，會自動加上免疫學、微生物學常用英文名詞（如 antibody、IgG、MHC、Staphylococcus aureus）與詞典裡的英文名詞，不用自己打。若模型把提示詞原文照抄進字幕，會自動刪除並在完成時告訴你。</div>
+      </details>
     </div>
   </div>
 
@@ -2522,7 +2531,7 @@ self.addEventListener('message', async (e) => {
         if (st.removed > 0) {
           result.chunks = st.chunks;
           result.text = st.chunks.map(function (c) { return c.text; }).join('');
-          self.postMessage({ type: 'PROMPT_LEAK_REMOVED', payload: { removed: st.removed, segIdx: segIdx } });
+          self.postMessage({ type: 'PROMPT_LEAK_REMOVED', payload: { removed: st.removed, segIdx: segIdx, startSec: startSec } });
         }
       }
 
@@ -2585,6 +2594,8 @@ function spawnWorker(code, options) {
 
 // r9：提示詞實際送進模型的情形，每次辨識只記一次（每段都會回報）
 let _promptInfoLogged = false;
+// r9 覆核 N12：這個檔案被自動移除「照抄提示詞」的段數／字詞數，辨識完成時在畫面上說明
+const _promptLeak = { segs: 0, words: 0 };
 function reportPromptInfo(x) {
   if (_promptInfoLogged) return;
   _promptInfoLogged = true;
@@ -2608,7 +2619,12 @@ function createWorker() {
   // r9-fix：Worker 發現並刪除損壞的暫存模型檔時，用白話記一筆（之後會自動重新下載該檔）
   inferenceWorker.addEventListener('message', (e) => {
     if (e.data?.type === 'PROMPT_INFO') reportPromptInfo(e.data.payload ?? {});
-    if (e.data?.type === 'PROMPT_LEAK_REMOVED') log(`🧹 段落 ${(e.data.payload?.segIdx ?? 0) + 1}：模型把提示詞原文照抄進字幕，已自動移除（${e.data.payload?.removed ?? 0} 個字詞）`, 'warn');
+    if (e.data?.type === 'PROMPT_LEAK_REMOVED') {
+      const p = e.data.payload ?? {};
+      _promptLeak.segs++; _promptLeak.words += (p.removed ?? 0);
+      const at = Number.isFinite(p.startSec) ? `，約 ${fmtTime(p.startSec).slice(0, 8)} 起` : '';
+      log(`🧹 第 ${(p.segIdx ?? 0) + 1} 段${at}：模型把提示詞原文照抄進字幕，已自動移除（${p.removed ?? 0} 個字詞）`, 'warn');
+    }
     if (e.data?.type === 'CACHE_REPAIRED') log(`⚠ 發現損壞的模型暫存檔「${e.data.payload?.file ?? ''}」（${e.data.payload?.why ?? ''}），已刪除並重新下載`, 'warn');
   });
   // 主執行緒側攔截 Worker 未捕獲錯誤，轉為 UI log 而非 console Uncaught Error
@@ -5284,6 +5300,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     const useDictInPrompt = !!document.getElementById('tog_medical')?.checked;
     const promptText = composeWhisperPrompt(userPrompt, medicalDict, useDictInPrompt);
     _promptInfoLogged = false;
+    _promptLeak.segs = 0; _promptLeak.words = 0;
     if (promptText) log(`💬 初始提示詞已啟用（${[userPrompt ? '你的提示詞' : '', useDictInPrompt ? '免疫／微生物等醫學英文名詞' : ''].filter(Boolean).join('＋')}）`, 'info');
     const CHUNK_SEC  = 30;
     const STRIDE_SEC = 5;
@@ -5430,6 +5447,10 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     if (skipped.length > 0) {
       const list = skipped.map((k) => `第 ${k.idx + 1} 段（${fmtTime(k.startSec).slice(0, 8)} 起）`).join('、');
       log(`⚠ ${skipped.length} 段辨識失敗已跳過：${list}`, 'warn');
+    }
+    // r9 覆核 N12：照抄提示詞被移除時，完成畫面也要說（不只寫在日誌），老師可回頭核對
+    if (_promptLeak.segs > 0) {
+      showUvrNotice(`有 ${_promptLeak.segs} 處是模型把提示詞原文照抄進字幕，已自動刪除（共 ${_promptLeak.words} 個字詞）。想核對的話，下方紀錄有寫是第幾段、從幾分幾秒開始。`, file && file.name);
     }
     setProgress(96, '後處理中...', false);
     resetEta();
