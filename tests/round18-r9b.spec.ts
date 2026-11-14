@@ -233,6 +233,35 @@ test.describe('r9 離線權重預檢（dtype）', () => {
     await ctx.close();
   });
 
+  test('D-05 覆核 N4：模型設定用外部權重（use_external_data_format）時，預檢也檢查 *.onnx_data；缺了就換 dtype／回報缺檔', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const res = await runInWorker(page, `
+      const ext = { 'encoder_model_fp16.onnx': 1, decoder_model_merged: 2 };
+      const names = { obj: _weightFilesFor('fp16', ext), t: _weightFilesFor('q8', true), none: _weightFilesFor('q8', null) };
+      ${seedW(['encoder_model_quantized.onnx', 'decoder_model_merged_quantized.onnx', 'encoder_model.onnx', 'decoder_model_merged.onnx', 'decoder_model_merged.onnx_data'])}
+      const c = await caches.open('transformers-cache');
+      await c.put('https://huggingface.co/${M}/resolve/main/config.json', new Response(JSON.stringify({ 'transformers.js_config': { use_external_data_format: true } })));
+      const cfg = await _localExternalDataCfg('${M}');
+      const missFp32 = await _missingWeights('${M}', 'fp32');        // 缺 encoder_model.onnx_data
+      const pick = await _pickOfflineDtype('${M}', 'fp32');          // q8 的 onnx_data 也沒有 → null
+      await c.put('https://huggingface.co/${M}/resolve/main/onnx/encoder_model.onnx_data', new Response('x'));
+      const pick2 = await _pickOfflineDtype('${M}', 'fp32');
+      await c.put('https://huggingface.co/${M}/resolve/main/config.json', new Response(JSON.stringify({})));
+      const pick3 = await _pickOfflineDtype('${M}', 'q8');            // 沒用外部權重 → 只看 .onnx
+      return { names, cfg, missFp32, pick, pick2, pick3 };
+    `);
+    expect(res.type, JSON.stringify(res)).toBe('T_OK');
+    expect(res.out.names.obj).toEqual(['onnx/encoder_model_fp16.onnx', 'onnx/encoder_model_fp16.onnx_data', 'onnx/decoder_model_merged_fp16.onnx', 'onnx/decoder_model_merged_fp16.onnx_data', 'onnx/decoder_model_merged_fp16.onnx_data_1']);
+    expect(res.out.names.t).toEqual(['onnx/encoder_model_quantized.onnx', 'onnx/encoder_model_quantized.onnx_data', 'onnx/decoder_model_merged_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx_data']);
+    expect(res.out.names.none).toEqual(['onnx/encoder_model_quantized.onnx', 'onnx/decoder_model_merged_quantized.onnx']);
+    expect(res.out.cfg).toBe(true);
+    expect(res.out.missFp32).toEqual(['encoder_model.onnx_data']);
+    expect(res.out.pick).toBeNull();
+    expect(res.out.pick2).toBe('fp32');
+    expect(res.out.pick3).toBe('q8');
+    await ctx.close();
+  });
+
   test('D-02 真實 Worker LOAD_MODEL（離線）：缺檔 → 不呼叫 pipeline、立即回 MODEL_WEIGHTS_MISSING；有其他 dtype → 改用它；顯示卡權重缺 → 直接用本機一般模式權重', async ({ browser }) => {
     const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
     const res = await runInWorker(page, `

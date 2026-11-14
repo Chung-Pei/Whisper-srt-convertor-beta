@@ -2318,20 +2318,57 @@ async function _pickAvailableDtype(modelId, preferred) {
 const DTYPE_SUFFIX = { fp32: '', fp16: '_fp16', q8: '_quantized', int8: '_int8', uint8: '_uint8', q4: '_q4', q4f16: '_q4f16', bnb4: '_bnb4' };
 const WHISPER_SESSIONS = ['encoder_model', 'decoder_model_merged'];
 function _isOffline() { return typeof navigator !== 'undefined' && navigator.onLine === false; }
-/** dtype（字串或 {encoder_model, decoder_model_merged}）→ 需要的 onnx 檔（相對於模型根目錄）。 */
-function _weightFilesFor(dtype) {
-  return WHISPER_SESSIONS.map(function (sess) {
+/** 外部權重設定（config.json 的 transformers.js_config.use_external_data_format）→ 該 .onnx 的外部資料檔數量。
+ *  與 Transformers.js 4.3.0 resolveExternalDataFormat 相同：true=1、數字＝分塊數、物件以完整檔名或 session 名稱查。 */
+function _externalChunks(ext, fullName, sess) {
+  if (!ext) return 0;
+  if (typeof ext === 'object') {
+    if (Object.prototype.hasOwnProperty.call(ext, fullName)) return +ext[fullName] || 0;
+    if (Object.prototype.hasOwnProperty.call(ext, sess)) return +ext[sess] || 0;
+    return 0;
+  }
+  return +ext || 0;
+}
+/** dtype（字串或 {encoder_model, decoder_model_merged}）→ 需要的 onnx 檔（相對於模型根目錄）；
+ *  r9 覆核 N4：模型設定使用外部權重時，一併列出 *.onnx_data（、*.onnx_data_1 …）。 */
+function _weightFilesFor(dtype, ext) {
+  const out = [];
+  WHISPER_SESSIONS.forEach(function (sess) {
     const d = typeof dtype === 'string' ? dtype : ((dtype && dtype[sess]) || 'fp32');
     const suf = Object.prototype.hasOwnProperty.call(DTYPE_SUFFIX, d) ? DTYPE_SUFFIX[d] : '_' + d;
-    return 'onnx/' + sess + suf + '.onnx';
+    const full = sess + suf + '.onnx';
+    out.push('onnx/' + full);
+    const n = Math.min(100, _externalChunks(ext, full, sess));
+    for (let i = 0; i < n; i++) out.push('onnx/' + full + '_data' + (i === 0 ? '' : '_' + i));
   });
+  return out;
+}
+/** 從本機（模型資料夾或瀏覽器快取）讀 config.json 的外部權重設定；讀不到回傳 null（只檢查 .onnx）。 */
+async function _localExternalDataCfg(modelId) {
+  let txt = null;
+  if (modelFolderHandle && !_folderBypass) {
+    try {
+      const loc = await _folderDirAndName(modelId + '/config.json', false);
+      if (loc) txt = await (await (await loc.dir.getFileHandle(loc.name, { create: false })).getFile()).text();
+    } catch (_) {}
+  }
+  if (!txt) {
+    try {
+      const c = await _realCache(); const tail = '/' + modelId + '/resolve/main/config.json';
+      for (const r of await c.keys()) {
+        if (String(r.url).split('?')[0].endsWith(tail)) { const res = await c.match(r); if (res) txt = await res.text(); break; }
+      }
+    } catch (_) {}
+  }
+  try { const cfg = JSON.parse(txt); const j = cfg && cfg['transformers.js_config']; return (j && j.use_external_data_format) || null; } catch (_) { return null; }
 }
 /** 回傳缺少的檔名陣列（空陣列＝都在）。查模型資料夾（非空檔）與瀏覽器快取。 */
-async function _missingWeights(modelId, dtype) {
+async function _missingWeights(modelId, dtype, ext) {
+  if (ext === undefined) ext = await _localExternalDataCfg(modelId);
   let keys = [];
   try { keys = (await (await _realCache()).keys()).map(function (r) { return String(r.url).split('?')[0]; }); } catch (_) {}
   const missing = [];
-  for (const rel of _weightFilesFor(dtype)) {
+  for (const rel of _weightFilesFor(dtype, ext)) {
     let ok = false;
     if (modelFolderHandle && !_folderBypass) {
       try {
@@ -2349,7 +2386,8 @@ async function _pickOfflineDtype(modelId, preferred) {
   const rank = DTYPE_FOOTPRINT_ORDER.indexOf(preferred);
   const order = rank < 0 ? [preferred].concat(DTYPE_FOOTPRINT_ORDER)
     : [preferred].concat(DTYPE_FOOTPRINT_ORDER.slice(rank + 1), DTYPE_FOOTPRINT_ORDER.slice(0, rank).reverse());
-  for (const d of order) { if ((await _missingWeights(modelId, d)).length === 0) return d; }
+  const ext = await _localExternalDataCfg(modelId);
+  for (const d of order) { if ((await _missingWeights(modelId, d, ext)).length === 0) return d; }
   return null;
 }
 function _weightsMissingError(modelId, dtype, stage) {
