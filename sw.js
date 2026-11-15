@@ -62,6 +62,15 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+// r10：頁面確認「這個 SW 會補跨來源隔離標頭」用（舊版 SW 不會回應，頁面就不會在舊版還接管時白白重新載入）
+self.addEventListener('message', (event) => {
+  if (event.data && event.data.type === 'COI_PING') {
+    const port = event.ports && event.ports[0];
+    const msg = { type: 'COI_PONG', v: 1 };
+    if (port) port.postMessage(msg); else if (event.source) event.source.postMessage(msg);
+  }
+});
+
 // ── Fetch 攔截 ────────────────────────────────────────────────────────────────
 self.addEventListener('fetch', (event) => {
   const { request } = event;

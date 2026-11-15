@@ -1,0 +1,159 @@
+// sw.js — Whisper 離線字幕產生器 Service Worker
+// CACHE_VERSION：由 scripts/build.mjs 於建置時自動產生（UTC，格式 YYYYMMDD-HHmm），不需手動遞增。
+// 此處的值僅為最後一次本機測試的殘留；實際上線版本以 dist/sw.js 為準。
+const CACHE_VERSION = '20261021-2323';
+const CACHE_PREFIX  = 'whisper-subtitler-';
+const CACHE_NAME    = `${CACHE_PREFIX}${CACHE_VERSION}`;
+
+// App Shell：只快取 UI 骨架
+// BASE 由 sw.js 自身網址推得：根目錄部署 → ''；子路徑部署（username.github.io/repo/）→ '/repo'
+// 不需手動修改；manifest.json 的 start_url／scope／icons 亦須維持相對路徑，兩者搭配才能在任何部署位置運作
+const BASE = new URL('./', self.location).pathname.replace(/\/$/, '');
+
+// ⚠ icons/ 清單必須與 manifest.json 的 icons[].src 及 index.html 的
+//   <link rel="apple-touch-icon">／<link rel="icon"> 三處完全一致（檔名、大小寫）。
+//   任一處 404 會讓 cache.addAll() 整體失敗、install 事件直接進入 redundant，
+//   導致離線功能完全無法使用（曾是實際發生過的部署失敗，非假設風險）。
+const APP_SHELL = [
+  `${BASE}/`,
+  `${BASE}/index.html`,
+  `${BASE}/manifest.json`,
+  `${BASE}/icons/icon-192.png`,
+  `${BASE}/icons/icon-192-maskable.png`,
+  `${BASE}/icons/icon-512.png`,
+  `${BASE}/icons/apple-touch-icon-180x180.png`,
+  `${BASE}/fonts/fonts.css`,
+  `${BASE}/fonts/IBMPlexMono-400-latin.woff2`,
+  `${BASE}/fonts/IBMPlexMono-400-latin-ext.woff2`,
+  `${BASE}/fonts/IBMPlexMono-600-latin.woff2`,
+  `${BASE}/fonts/IBMPlexMono-600-latin-ext.woff2`,
+  `${BASE}/fonts/Syne-latin.woff2`,
+  `${BASE}/fonts/Syne-latin-ext.woff2`,
+];
+
+// ── 安裝：快取 App Shell ──────────────────────────────────────────────────────
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting())
+      .catch((err) => {
+        // addAll 若有任一資源 404 即失敗；記錄後重拋讓 SW install 正確中止
+        console.error('[SW] install failed:', err);
+        throw err;
+      })
+  );
+});
+
+// ── 啟動：清除本程式的舊版快取 ─────────────────────────────────────────────────
+// Cache Storage 以「網域」為單位：同一個 github.io 網域下的其他 PWA 共用同一份。
+// 只能刪自己前綴的舊版，不可刪「所有不等於 CACHE_NAME 的快取」，否則會清掉同網域其他應用的快取。
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+            .map((key) => caches.delete(key))
+        )
+      )
+      .then(() => self.clients.claim())
+  );
+});
+
+// ── Fetch 攔截 ────────────────────────────────────────────────────────────────
+self.addEventListener('fetch', (event) => {
+  const { request } = event;
+
+  // 只處理 GET 請求
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+
+  // 跳過非同源請求（CDN 字型、huggingface 模型等）
+  if (url.origin !== self.location.origin) return;
+
+  // 頁面導航：Network First，離線時回傳快取的 index.html
+  if (request.mode === 'navigate') {
+    event.respondWith(navigationHandler(request));
+    return;
+  }
+
+  // 靜態資源（圖示、manifest）：Cache First
+  if (isStaticAsset(url.pathname)) {
+    event.respondWith(cacheFirst(request));
+    return;
+  }
+
+  // 其他同源請求：Network First
+  event.respondWith(networkFirst(request));
+});
+
+// ── 策略函式 ──────────────────────────────────────────────────────────────────
+
+function isStaticAsset(pathname) {
+  return (
+    pathname.startsWith(`${BASE}/icons/`) ||
+    pathname.startsWith(`${BASE}/fonts/`) ||
+    pathname === `${BASE}/manifest.json` ||
+    /\.(png|jpg|jpeg|svg|webp|ico|woff2?|ttf)$/.test(pathname)
+  );
+}
+
+async function cacheFirst(request) {
+  const cached = await caches.match(request);
+  if (cached) return cached;
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(request, response.clone()); // BUG-3 fix: await
+    }
+    return response;
+  } catch {
+    return new Response('', { status: 503, statusText: 'Offline' });
+  }
+}
+
+async function networkFirst(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(request, response.clone()); // BUG-3 fix: await
+    }
+    return response;
+  } catch {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    // BUG-6 fix: 回傳可識別的離線錯誤頁，而非空白 503
+    return new Response(
+      JSON.stringify({ error: 'offline' }),
+      { status: 503, statusText: 'Offline', headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+}
+
+async function navigationHandler(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      const cache = await caches.open(CACHE_NAME);
+      await cache.put(request, response.clone()); // BUG-3 fix: await
+    }
+    return response;
+  } catch {
+    // 離線時依序嘗試：精確路徑 → index.html → 根目錄 → 內建離線頁
+    const cached =
+      (await caches.match(request)) ||
+      (await caches.match(`${BASE}/index.html`)) ||
+      (await caches.match(`${BASE}/`));
+    if (cached) return cached;
+    return new Response(
+      '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>離線中</title></head>' +
+      '<body style="font-family:sans-serif;padding:2rem"><h1>離線中</h1><p>請連線後重試。</p></body></html>',
+      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+    );
+  }
+}

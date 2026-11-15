@@ -224,12 +224,15 @@ export async function routeRealOrt(page: Page, served: string[] = []) {
 /** r10：真的 Service Worker 會在第一次開啟時自動重新載入一次（取得跨來源隔離以啟用多核心）。
  *  允許 SW 的測試在 goto 之後等頁面隔離完成、重新載入結束，避免 evaluate 撞上「Execution context was destroyed」。 */
 export async function waitIsolated(page: Page, timeout = 15_000): Promise<boolean> {
+  // 頁面在 SW 註冊後寫 window.__swState（ok／fail）與 __coiState（isolated／reloading／unsupported／busy／old-sw）。
+  // SW 被封鎖（newCtx）→ 註冊失敗即返回；允許 SW → 等到隔離或確定不會重新載入（不再用固定 1.2 秒猜，慢 CI 不會中途撞上重新載入）
   const start = Date.now(), end = start + timeout;
   while (Date.now() < end) {
     try {
-      if (await page.evaluate(() => self.crossOriginIsolated)) { await page.waitForLoadState('load'); return true; }
-      // 封鎖 SW 的 context（newCtx）：永遠不會隔離，1.2 秒後仍無註冊就直接返回
-      if (Date.now() - start > 1200 && !(await page.evaluate(async () => !!navigator.serviceWorker && !!(await navigator.serviceWorker.getRegistration())))) return false;
+      const st = await page.evaluate(() => ({ iso: self.crossOriginIsolated, sw: (window as any).__swState, coi: (window as any).__coiState, hasSW: 'serviceWorker' in navigator }));
+      if (st.iso) { await page.waitForLoadState('load'); return true; }
+      if (!st.hasSW || st.sw === 'fail' || st.coi === 'unsupported' || st.coi === 'busy') return false;
+      if (Date.now() - start > 5000 && !st.sw && !(await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())))) return false;
     } catch { /* 正在重新載入 */ }
     await page.waitForTimeout(200);
   }

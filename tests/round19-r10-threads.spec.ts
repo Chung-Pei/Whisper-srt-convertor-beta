@@ -5,7 +5,9 @@
 //   MT-02  離線（SW 從快取回應頁面）仍帶標頭、仍隔離
 //   MT-03  瀏覽器不支援（模擬：SW 不補標頭）→ 最多重新載入一次，不會無限重載，頁面照常可用
 //   MT-04  已選檔案時 SW 更新 → 不自動重新載入（不打斷使用者）
-//   MT-05  執行緒數規則：未隔離＝1；2 核以下全用；其餘＝核心數−1，最多 8
+//   MT-05  執行緒數規則：未隔離＝1；2 核以下全用；3–4 核＝核心數−1；5 以上＝一半，最多 6；localStorage 覆寫
+//   MT-07  （第 1 輪覆核 M1）舊版 SW（r9，不補標頭）升級：舊版接管時不白白重載；新版接管後自動重新載入一次 → 已隔離
+//   MT-08  （M2）瀏覽器確定不支援時記下，同一瀏覽器開第二個分頁不再重新載入
 //   MT-06  隔離後真實 onnxruntime-web 在 Worker 內以 2 條執行緒建立 session 並推論成功（跨站載入的 WASM／執行緒 Worker 不被擋）
 import { test, expect, type Page } from '@playwright/test';
 import fs from 'fs';
@@ -60,20 +62,29 @@ test.describe('r10 多核心運算（跨來源隔離）', () => {
 
   test('MT-03 瀏覽器不支援隔離：最多重新載入一次，不會無限重載', async ({ browser }) => {
     const ctx = await browser.newContext();
-    // 模擬 Safari：SW 不補標頭（withIsolationHeaders 原樣回傳）
-    const sw = fs.readFileSync(path.join(path.dirname(ROOT_HTML), 'sw.js'), 'utf8')
-      .replace('function withIsolationHeaders(response) {', 'function withIsolationHeaders(response) { return response;');
-    await ctx.route(/\/sw\.js$/, (r) => r.fulfill({ status: 200, contentType: 'text/javascript', body: sw }));
+    // 模擬 Safari：SW 照常（會回應、會補標頭），但瀏覽器不認 credentialless → 頁面永遠不是隔離狀態
+    // （不用 route 換 sw.js：Playwright 的 route 攔不到 SW 腳本本身，之前的模擬其實沒生效）
+    await ctx.addInitScript(() => { Object.defineProperty(window, 'crossOriginIsolated', { get: () => false, configurable: true }); });
     const page = await ctx.newPage();
     let navs = 0;
     page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
     await page.goto(BASE_URL);
     await page.evaluate(() => navigator.serviceWorker.ready);
     await page.waitForTimeout(4000);
-    expect(navs).toBeLessThanOrEqual(2);
+    expect(navs).toBe(2);                                                    // 新版 SW 接管後試一次
     expect(await page.evaluate(() => self.crossOriginIsolated)).toBe(false);
+    await expect.poll(() => page.evaluate(() => (window as any).__coiState)).toBe('unsupported');
+    // MT-08：同一瀏覽器開第二個分頁 → 已知不支援，不再重新載入
+    const p2 = await ctx.newPage();
+    let navs2 = 0;
+    p2.on('framenavigated', (f) => { if (f === p2.mainFrame()) navs2++; });
+    await p2.goto(BASE_URL); await p2.waitForTimeout(2500);
+    expect(navs2).toBe(1);
+    expect(await p2.evaluate(() => self.crossOriginIsolated)).toBe(false);
+    expect(await p2.evaluate(() => (window as any).__coiState)).toBe('unsupported');
     await page.reload(); await page.waitForTimeout(1500);
-    expect(navs).toBeLessThanOrEqual(3);                                     // 同一分頁不再自動重載
+    expect(navs).toBe(3);                                                    // 同一分頁不再自動重載
+    expect(await p2.evaluate(() => (window as any).__coiUnsupported())).toBe(true);
     await expect(page.locator('#startBtn')).toBeVisible();
     await ctx.close();
   });
@@ -98,6 +109,39 @@ test.describe('r10 多核心運算（跨來源隔離）', () => {
     await page.waitForTimeout(1500);
     expect(navs).toBe(1);
     await expect(page.locator('.batch-item')).toHaveCount(1);              // 使用者選的檔案還在
+    expect(await page.evaluate(() => (window as any).__coiState)).toBe('busy');
+    await ctx.close();
+  });
+
+  test('MT-04b 已輸入提示詞也算忙碌（重新載入會弄丟）', async ({ browser }) => {
+    const ctx = await browser.newContext({ serviceWorkers: 'block' });
+    const page = await ctx.newPage();
+    await page.goto(BASE_URL);
+    expect(await page.evaluate(() => (window as any).__whisperBusy())).toBe(false);
+    await page.locator('#initialPrompt').fill('今天講 MHC');
+    expect(await page.evaluate(() => (window as any).__whisperBusy())).toBe(true);
+    await ctx.close();
+  });
+
+  test('MT-07 舊版 SW 升級：舊版接管時不重載，新版接管後重新載入一次 → 已隔離', async ({ browser }) => {
+    const ctx = await browser.newContext();
+    const oldSw = fs.readFileSync(path.join(__dirname, 'fixtures', 'sw-r9.js'), 'utf8');
+    const newSw = fs.readFileSync(path.join(path.dirname(ROOT_HTML), 'sw.js'), 'utf8');
+    let serveNew = false;
+    await ctx.route(/\/sw\.js$/, (r) => r.fulfill({ status: 200, contentType: 'text/javascript', headers: { 'cache-control': 'no-store' }, body: serveNew ? newSw : oldSw }));
+    const page = await ctx.newPage();
+    let navs = 0;
+    page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
+    await page.goto(BASE_URL);
+    await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 15_000 });
+    await expect.poll(() => page.evaluate(() => (window as any).__coiState)).toBe('old-sw');   // 舊版不回應 → 不白白重載
+    await page.waitForTimeout(800);
+    expect(navs).toBe(1);
+    serveNew = true;
+    await page.reload();                                                     // 舊版回應頁面；註冊時發現新版 → 接管後自動重載
+    await page.waitForFunction(() => self.crossOriginIsolated === true, null, { timeout: 20_000 });
+    await page.waitForLoadState('load');
+    expect(navs).toBe(3);
     await ctx.close();
   });
 
@@ -113,10 +157,21 @@ test.describe('r10 多核心運算（跨來源隔離）', () => {
     expect(calc(true, undefined)).toBe(1);
     expect(calc(true, 1)).toBe(1);
     expect(calc(true, 2)).toBe(2);
+    expect(calc(true, 3)).toBe(2);
     expect(calc(true, 4)).toBe(3);
-    expect(calc(true, 8)).toBe(7);
-    expect(calc(true, 12)).toBe(8);
-    expect(calc(true, 32)).toBe(8);
+    expect(calc(true, 6)).toBe(3);
+    expect(calc(true, 8)).toBe(4);
+    expect(calc(true, 12)).toBe(6);
+    expect(calc(true, 32)).toBe(6);
+    const calcOv = (iso: boolean, ov: any) => new Function('self', 'SharedArrayBuffer', `${src}; return wasmThreadCount();`)({ crossOriginIsolated: iso, navigator: { hardwareConcurrency: 8 }, __whisperThreadsOverride: ov }, SharedArrayBuffer);
+    expect(calcOv(true, 8)).toBe(8);
+    expect(calcOv(true, 99)).toBe(4);
+    expect(calcOv(true, null)).toBe(4);
+    expect(calcOv(false, 8)).toBe(1);
+    // 辨識 Worker 回報實際執行緒數；VAD 主執行緒固定 1；說話者分割最多 2
+    expect(html).toContain("threads: wasmThreads, isolated: !!self.crossOriginIsolated }");
+    expect(html).toContain('window.ort.env.wasm.numThreads = 1');
+    expect(html).toContain('numThreads = Math.min(2, wasmThreadCount())');
     // 辨識 Worker 與人聲分離共用同一規則，且設在 Transformers.js 的 onnx wasm 設定上
     expect(html).toContain('envRef.backends.onnx.wasm.numThreads = wasmThreads');
     expect(html).toContain('const threads = wasmThreadCount();');

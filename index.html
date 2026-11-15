@@ -1835,7 +1835,8 @@ let activeIdbCacheKey = null;
 
 let batchQueue    = [];
 // r10：給 Service Worker 註冊腳本（非 module，看不到這裡的變數）判斷能否自動重新載入：處理中或已選檔案時不打斷
-window.__whisperBusy = () => isRunning || batchQueue.length > 0;
+window.__whisperBusy = () => isRunning || batchQueue.length > 0 || !!modelFolderHandle || !!outFolderHandle
+  || !!(document.getElementById('initialPrompt') && document.getElementById('initialPrompt').value.trim());
 let _previewNoticeCleanups = [];  // 每次 renderBatchQueue() 重繪前，先清除舊面板遺留的 #outFormat change listener
 let batchIdSeq    = 0;
 let isCancelled   = false;
@@ -1948,13 +1949,21 @@ self.addEventListener('unhandledrejection', (e) => {
 // ── r10：多核心運算（WASM 多執行緒）──────────────────────────────────────────
 // GitHub Pages 不送 COOP/COEP 標頭 → 頁面不是 crossOriginIsolated → 沒有 SharedArrayBuffer → onnxruntime-web 只能用 1 條執行緒。
 // 現由 sw.js 在頁面回應補上 COOP: same-origin＋COEP: credentialless（首次開啟自動重新載入一次），隔離後才能多執行緒。
-// 執行緒數＝邏輯核心數−1（留一核給畫面），最多 8；2 核以下全用；未隔離（例如 Safari 不支援 credentialless）＝1，照舊可用只是較慢。
-// 以 toString() 注入 Worker（不可引用外部變數、不可用反引號）。
+// 執行緒數（hardwareConcurrency 是「邏輯核心」，含超執行緒；大小核電腦開太多會被最慢的核拖住）：
+//   2 核以下全用（實測 2 核 1.6 倍）；3–4 → 核心數−1；5 以上 → 一半（無條件進位），最多 6。
+//   未隔離（例如 Safari 不支援 credentialless）＝1，照舊可用只是較慢。
+//   隱藏覆寫：localStorage['whisper-threads'] = 1–16（日後在真機量測用；仍須已隔離）。
+// 以 toString() 注入 Worker（不可引用外部變數、不可用反引號）；覆寫值由主執行緒以 self.__whisperThreadsOverride 帶入。
 function wasmThreadCount() {
   if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1;
+  const ov = Math.floor(Number(self.__whisperThreadsOverride));
+  if (ov >= 1 && ov <= 16) return ov;
   const hc = Math.max(1, Math.floor(Number(self.navigator && self.navigator.hardwareConcurrency) || 1));
-  return hc <= 2 ? hc : Math.min(hc - 1, 8);
+  if (hc <= 2) return hc;
+  if (hc <= 4) return hc - 1;
+  return Math.min(Math.ceil(hc / 2), 6);
 }
+try { self.__whisperThreadsOverride = Number(localStorage.getItem('whisper-threads')) || null; } catch (_) { self.__whisperThreadsOverride = null; }
 
 // ── 辨識／說話者分割兩個 Worker 共用的 Transformers.js 載入器（r7 抽出）──────────────
 // 原本兩個 Worker 各自複製「主 CDN 失敗 → 備援 CDN」的 try/catch，且已分歧：說話者分割在兩個 CDN 都失敗時
@@ -2089,6 +2098,7 @@ function promptDecoderIdsForPipe(pipe, promptText, language, task, maxTokens) {
 
 // 【核心修復 1】：加入 await 以確保 Transformers.js 模型徹底釋放，防止 OOM
 const WORKER_CODE = `${WORKER_ERROR_FORWARD}${WORKER_IMPORT_TRANSFORMERS}
+self.__whisperThreadsOverride = ${JSON.stringify(self.__whisperThreadsOverride)};
 ${wasmThreadCount.toString()}
 
 // r9：初始提示詞相關函式（與主執行緒同一份原始碼）
@@ -2659,6 +2669,8 @@ function createWorker() {
 //  處理大型音訊：以 10s 滑動視窗分段處理後合併
 // ══════════════════════════════════════════════════════════════════════
 const DIARIZATION_WORKER_CODE = `${WORKER_ERROR_FORWARD}${WORKER_IMPORT_TRANSFORMERS}
+self.__whisperThreadsOverride = null;
+${wasmThreadCount.toString()}
 const MODEL_ID = 'onnx-community/pyannote-segmentation-3.0';
 const SAMPLE_RATE = 16000;
 const CHUNK_SAMPLES = 10 * SAMPLE_RATE;   // 10s per chunk
@@ -2673,6 +2685,8 @@ async function loadModels(progress_cb) {
   const { mod } = await importTransformers();
   const { AutoProcessor, AutoModelForAudioFrameClassification, env } = mod;
   env.allowLocalModels = false;
+  // r10：說話者分割模型小，可能與其他工作同時跑 → 固定最多 2 條執行緒，避免搶走辨識的核心
+  try { if (env.backends && env.backends.onnx && env.backends.onnx.wasm) env.backends.onnx.wasm.numThreads = Math.min(2, wasmThreadCount()); } catch (_) {}
   processor = await AutoProcessor.from_pretrained(MODEL_ID, { progress_callback: progress_cb });
   model     = await AutoModelForAudioFrameClassification.from_pretrained(MODEL_ID, { progress_callback: progress_cb });
 }
@@ -2980,15 +2994,19 @@ async function reloadWorkerForRetry(kind, modelId) {
   return worker;
 }
 
-/** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
 // r10：一般模式（CPU）用了幾個核心——每個 Worker 只說一次
 let _cpuThreadsLogged = null;
 function logCpuThreads(n) {
   if (_cpuThreadsLogged === n) return;
   _cpuThreadsLogged = n;
   if (n > 1) log(`多核心加速：已啟用（一般模式同時用 ${n} 個核心）`, 'ok');
-  else log('多核心加速：這個瀏覽器不支援，一般模式只用 1 個核心（較慢；建議用 Chrome 或 Edge）', 'warn');
+  else if ((navigator.hardwareConcurrency || 1) <= 1) return;   // 本來就只有 1 個核心：不用提
+  else if (window.__coiUnsupported && window.__coiUnsupported())
+    log('這個瀏覽器只能用 1 個核心跑一般模式（較慢）。想更快可改用 Chrome 或 Edge', 'warn');
+  else log('多核心加速尚未啟用：處理完後重新整理頁面即可加快（一般模式目前只用 1 個核心）', 'warn');
 }
+
+/** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
 
 function applyBackendInfo(x) {
   _lastBackend = x.backend ?? null;
@@ -7314,15 +7332,48 @@ bindEditorEvents();
 // 第一次開啟（SW 尚未接管）或 SW 剛更新時，自動重新載入一次。條件：尚未隔離、已被 SW 接管、
 // 這個分頁還沒試過（sessionStorage 記號，瀏覽器不支援時不會無限重載）、沒有正在處理或已選的檔案（不打斷使用者）。
 const COI_RELOAD_KEY = 'whisper-coi-reload';
-function maybeReloadForIsolation() {
+const COI_UNSUPPORTED_KEY = 'whisper-coi-unsupported';
+// 瀏覽器確定不支援（重新載入過、新版 SW 確實在補標頭，仍未隔離）：記下目前瀏覽器版本，之後開新分頁不再白白重載；換版本會再試一次
+window.__coiUnsupported = () => {
+  try { return localStorage.getItem(COI_UNSUPPORTED_KEY) === navigator.userAgent; } catch (e) { return false; }
+};
+// 確認目前接管頁面的 SW 是會補標頭的新版（舊版 SW 不回應 → 不重載，等新版接管觸發 controllerchange 再判斷）
+function pingIsolationSW(ctrl, ms = 1000) {
+  return new Promise((resolve) => {
+    const sw = navigator.serviceWorker;
+    const finish = (ok) => { clearTimeout(t); sw.removeEventListener('message', onMsg); resolve(ok); };
+    const onMsg = (e) => { if (e.data && e.data.type === 'COI_PONG') finish(true); };
+    const t = setTimeout(() => finish(false), ms);
+    sw.addEventListener('message', onMsg);
+    try { ctrl.postMessage({ type: 'COI_PING' }); } catch (e) { finish(false); }
+  });
+}
+let _coiChecking = false, _coiAgain = false;
+async function maybeReloadForIsolation() {
+  if (_coiChecking) { _coiAgain = true; return; }   // 檢查中又遇到 SW 換手：檢查完再判斷一次
+  _coiChecking = true;
   try {
-    if (window.crossOriginIsolated) { sessionStorage.removeItem(COI_RELOAD_KEY); return; }
-    if (!window.isSecureContext || !navigator.serviceWorker.controller) return;
-    if (sessionStorage.getItem(COI_RELOAD_KEY)) return;
-    if (typeof window.__whisperBusy === 'function' && window.__whisperBusy()) return;
+    if (window.crossOriginIsolated) { sessionStorage.removeItem(COI_RELOAD_KEY); window.__coiState = 'isolated'; return; }
+    const ctrl = navigator.serviceWorker.controller;
+    if (!window.isSecureContext || !ctrl) return;
+    if (window.__coiUnsupported()) { window.__coiState = 'unsupported'; return; }
+    if (!(await pingIsolationSW(ctrl))) { window.__coiState = 'old-sw'; return; }
+    if (navigator.serviceWorker.controller !== ctrl || window.crossOriginIsolated) return;
+    if (sessionStorage.getItem(COI_RELOAD_KEY)) {
+      // 已經由新版 SW 重新載入過仍未隔離 → 這個瀏覽器不支援
+      try { localStorage.setItem(COI_UNSUPPORTED_KEY, navigator.userAgent); } catch (e) {}
+      window.__coiState = 'unsupported';
+      return;
+    }
+    if (typeof window.__whisperBusy === 'function' && window.__whisperBusy()) { window.__coiState = 'busy'; return; }
     sessionStorage.setItem(COI_RELOAD_KEY, '1');
+    window.__coiState = 'reloading';
     location.reload();
-  } catch (e) { /* sessionStorage 被封鎖等：維持單執行緒，不影響使用 */ }
+  } catch (e) { window.__coiState = 'error'; /* sessionStorage 被封鎖等：維持單執行緒，不影響使用 */ }
+  finally {
+    _coiChecking = false;
+    if (_coiAgain) { _coiAgain = false; maybeReloadForIsolation(); }
+  }
 }
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('controllerchange', maybeReloadForIsolation);
@@ -7330,6 +7381,7 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js', { scope: './' })
       .then((reg) => {
         console.info('[SW] 已註冊', reg.scope);
+        window.__swState = 'ok';
         maybeReloadForIsolation();
         // 偵測新版本可用
         reg.addEventListener('updatefound', () => {
@@ -7341,7 +7393,7 @@ if ('serviceWorker' in navigator) {
           });
         });
       })
-      .catch((err) => console.warn('[SW] 註冊失敗：', err));
+      .catch((err) => { window.__swState = 'fail'; console.warn('[SW] 註冊失敗：', err); });
   });
 }
 </script>
