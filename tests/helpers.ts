@@ -5,6 +5,7 @@
 import { expect, type Page } from '@playwright/test';
 import path from 'path';
 
+import { waitIsolated } from './harness';
 export const BASE_URL = process.env.WHISPER_TEST_URL ?? 'http://localhost:8080/index.html';
 export const SAMPLE_AUDIO = path.join(__dirname, 'fixtures', 'sample.mp3');
 
@@ -52,6 +53,7 @@ export async function setToggles(page: Page, on: string[], off: string[]) {
 
 export async function recognize(page: Page) {
   await page.goto(BASE_URL);
+  await waitIsolated(page);   // r10：允許 SW 的 context 首次開啟會自動重新載入一次
   await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
 }
 

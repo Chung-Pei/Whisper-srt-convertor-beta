@@ -1834,6 +1834,8 @@ let workerReady       = false;
 let activeIdbCacheKey = null;
 
 let batchQueue    = [];
+// r10：給 Service Worker 註冊腳本（非 module，看不到這裡的變數）判斷能否自動重新載入：處理中或已選檔案時不打斷
+window.__whisperBusy = () => isRunning || batchQueue.length > 0;
 let _previewNoticeCleanups = [];  // 每次 renderBatchQueue() 重繪前，先清除舊面板遺留的 #outFormat change listener
 let batchIdSeq    = 0;
 let isCancelled   = false;
@@ -1942,6 +1944,17 @@ self.addEventListener('unhandledrejection', (e) => {
   e.preventDefault();
 });
 `;
+
+// ── r10：多核心運算（WASM 多執行緒）──────────────────────────────────────────
+// GitHub Pages 不送 COOP/COEP 標頭 → 頁面不是 crossOriginIsolated → 沒有 SharedArrayBuffer → onnxruntime-web 只能用 1 條執行緒。
+// 現由 sw.js 在頁面回應補上 COOP: same-origin＋COEP: credentialless（首次開啟自動重新載入一次），隔離後才能多執行緒。
+// 執行緒數＝邏輯核心數−1（留一核給畫面），最多 8；2 核以下全用；未隔離（例如 Safari 不支援 credentialless）＝1，照舊可用只是較慢。
+// 以 toString() 注入 Worker（不可引用外部變數、不可用反引號）。
+function wasmThreadCount() {
+  if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') return 1;
+  const hc = Math.max(1, Math.floor(Number(self.navigator && self.navigator.hardwareConcurrency) || 1));
+  return hc <= 2 ? hc : Math.min(hc - 1, 8);
+}
 
 // ── 辨識／說話者分割兩個 Worker 共用的 Transformers.js 載入器（r7 抽出）──────────────
 // 原本兩個 Worker 各自複製「主 CDN 失敗 → 備援 CDN」的 try/catch，且已分歧：說話者分割在兩個 CDN 都失敗時
@@ -2076,6 +2089,7 @@ function promptDecoderIdsForPipe(pipe, promptText, language, task, maxTokens) {
 
 // 【核心修復 1】：加入 await 以確保 Transformers.js 模型徹底釋放，防止 OOM
 const WORKER_CODE = `${WORKER_ERROR_FORWARD}${WORKER_IMPORT_TRANSFORMERS}
+${wasmThreadCount.toString()}
 
 // r9：初始提示詞相關函式（與主執行緒同一份原始碼）
 const PROMPT_MAX_TOKENS = ${PROMPT_MAX_TOKENS};
@@ -2279,7 +2293,8 @@ function installFolderFetchInterceptor() {
 async function loadLib() {
   if (pipelineFn) return;
   const { mod, fallback } = await importTransformers();
-  self.postMessage({ type: 'LIB_VERSION', payload: { version: '${HF_TRANSFORMERS_VERSION}' + (fallback ? '-fallback' : '') } });
+  const wasmThreads = wasmThreadCount();
+  self.postMessage({ type: 'LIB_VERSION', payload: { version: '${HF_TRANSFORMERS_VERSION}' + (fallback ? '-fallback' : ''), threads: wasmThreads, isolated: !!self.crossOriginIsolated } });
   pipelineFn    = mod.pipeline;
   ModelRegistry = mod.ModelRegistry ?? null;  // v4 才有
   envRef        = mod.env;
@@ -2289,6 +2304,8 @@ async function loadLib() {
     // r9-fix：經過檢查的快取（損壞自動刪除重抓）；fetch 一律走目前的 self.fetch（之後才選資料夾也會經過攔截器）
     if (typeof caches !== 'undefined') { envRef.useCustomCache = true; envRef.customCache = guardedCache; }
     envRef.fetch = (u, i) => self.fetch(u, i);
+    // r10：明確設定 WASM 執行緒數（須在第一個 session 建立前；env.backends.onnx.wasm 與 onnxruntime 的 env.wasm 是同一個物件）
+    try { if (envRef.backends && envRef.backends.onnx && envRef.backends.onnx.wasm) envRef.backends.onnx.wasm.numThreads = wasmThreads; } catch (_) {}
   }
 }
 
@@ -2964,6 +2981,15 @@ async function reloadWorkerForRetry(kind, modelId) {
 }
 
 /** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
+// r10：一般模式（CPU）用了幾個核心——每個 Worker 只說一次
+let _cpuThreadsLogged = null;
+function logCpuThreads(n) {
+  if (_cpuThreadsLogged === n) return;
+  _cpuThreadsLogged = n;
+  if (n > 1) log(`多核心加速：已啟用（一般模式同時用 ${n} 個核心）`, 'ok');
+  else log('多核心加速：這個瀏覽器不支援，一般模式只用 1 個核心（較慢；建議用 Chrome 或 Edge）', 'warn');
+}
+
 function applyBackendInfo(x) {
   _lastBackend = x.backend ?? null;
   if (x.reason === 'gpu-weights-offline')
@@ -4344,6 +4370,8 @@ async function ensureVadScripts() {
     try { await loadScript(ONNX_WASM_CDN + f); ortLoaded = true; break; } catch { /* 試下一個檔名 */ }
   }
   if (!ortLoaded) throw new Error('onnxruntime-web 載入失敗（請確認網路連線）');
+  // r10：頁面隔離後 onnxruntime 預設會開多執行緒；VAD 跑在主執行緒、模型很小，固定 1 條避免卡畫面
+  try { if (window.ort && window.ort.env && window.ort.env.wasm) window.ort.env.wasm.numThreads = 1; } catch (_) {}
   await loadVadBundle();
 }
 
@@ -5110,7 +5138,7 @@ async function runVocalSeparation(file, { wantWav = true } = {}) {
     worker.onerror = (e) => { e.preventDefault(); };   // 錯誤由 WORKER_ERROR_FORWARD 轉成 ERROR 訊息處理
 
     setProgress(53, '人聲分離：載入模型（首次較久）...', true);
-    const threads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+    const threads = wasmThreadCount();   // r10：與辨識同一規則
     const tryGpu = isWebGPUSupported() && !_gpuFailedModels.has(UVR_MODEL_NAME);
     const ready = await workerCall(worker, 'INIT', { model, threads, gpu: tryGpu }, 'READY', 300_000, { transfer: [model] });
     const initBackend = ready.payload?.backend ?? 'wasm';
@@ -5261,6 +5289,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
           const ver = x.version ?? '';
           const isFb = ver.includes('fallback');
           log(`Transformers.js ${ver} ${isFb ? '（備用 CDN 載入）' : '✓'}`, isFb ? 'warn' : 'info');
+          if (typeof x.threads === 'number') logCpuThreads(x.threads);
         }
       };
       worker.addEventListener('message', progressHandler);
@@ -7281,11 +7310,27 @@ bindEditorEvents();
 
 <script>
 // ── Service Worker 註冊 ──────────────────────────────────────────────────────
+// r10：多核心運算需要頁面「跨來源隔離」，標頭由 sw.js 補上；但只有經過 SW 載入的頁面才有。
+// 第一次開啟（SW 尚未接管）或 SW 剛更新時，自動重新載入一次。條件：尚未隔離、已被 SW 接管、
+// 這個分頁還沒試過（sessionStorage 記號，瀏覽器不支援時不會無限重載）、沒有正在處理或已選的檔案（不打斷使用者）。
+const COI_RELOAD_KEY = 'whisper-coi-reload';
+function maybeReloadForIsolation() {
+  try {
+    if (window.crossOriginIsolated) { sessionStorage.removeItem(COI_RELOAD_KEY); return; }
+    if (!window.isSecureContext || !navigator.serviceWorker.controller) return;
+    if (sessionStorage.getItem(COI_RELOAD_KEY)) return;
+    if (typeof window.__whisperBusy === 'function' && window.__whisperBusy()) return;
+    sessionStorage.setItem(COI_RELOAD_KEY, '1');
+    location.reload();
+  } catch (e) { /* sessionStorage 被封鎖等：維持單執行緒，不影響使用 */ }
+}
 if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('controllerchange', maybeReloadForIsolation);
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('./sw.js', { scope: './' })
       .then((reg) => {
         console.info('[SW] 已註冊', reg.scope);
+        maybeReloadForIsolation();
         // 偵測新版本可用
         reg.addEventListener('updatefound', () => {
           const newWorker = reg.installing;

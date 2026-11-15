@@ -1,7 +1,7 @@
 // tests/round14-review.spec.ts — r7 穿透式審查：每個缺陷先寫會失敗的測試，修正後轉綠。
 // 涵蓋：VAD 切段不可吃掉每段開頭的字、VAD 閾值語意、取消說話者分割不可卡住、Service Worker 不可誤刪他人快取。
 import { test, expect, type Page } from '@playwright/test';
-import { newCtx, installScriptedWorker, openWithHook, type Seg } from './harness';
+import { newCtx, installScriptedWorker, openWithHook, waitIsolated, type Seg } from './harness';
 import { setToggles, downloadText, BASE_URL } from './helpers';
 
 /** 16 kHz mono 16-bit WAV：bursts 內為 220 Hz 正弦（RMS≈0.21），其餘靜音。 */
@@ -187,6 +187,7 @@ test.describe('r7 審查：取消與 Service Worker', () => {
       await caches.open('whisper-subtitler-19700101-0000');             // 自己的舊版：應被清掉
     });
     await page.goto(BASE_URL);
+    await waitIsolated(page);                                           // r10：首次開啟會自動重新載入一次（多核心）
     await page.evaluate(() => navigator.serviceWorker.ready);
     await expect.poll(async () => page.evaluate(async () => (await caches.keys()).includes('whisper-subtitler-19700101-0000')), { timeout: 10_000 }).toBe(false);
     const keys = await page.evaluate(() => caches.keys());

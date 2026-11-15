@@ -22,7 +22,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
-import { newCtx, openWithHook, routeRealOrt, REAL_ORT_AVAILABLE, HALF_MODEL_PATH } from './harness';
+import { newCtx, openWithHook, routeRealOrt, REAL_ORT_AVAILABLE, HALF_MODEL_PATH, gotoSettled } from './harness';
 
 const DIST_URL = process.env.WHISPER_DIST_TEST_URL ?? 'http://localhost:8081/index.html';
 const SAMPLE_AUDIO = path.join(__dirname, 'fixtures', 'sample.mp3');
@@ -83,7 +83,7 @@ test.describe('dist CSP：靜態結構與生效對照組', () => {
   // 測試以約 40% 的機率失敗（原版 r6 同樣，重複 40 次失敗 20 次）。與下方兩處相同，封鎖 SW 即可穩定。
   test.use({ serviceWorkers: 'block' });
   test('CSP <meta> 位於 <head> 內緊接 charset 的第 2 個元素，且含 3 個 script hash', async ({ page }) => {
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const info = await page.evaluate(() => {
       const kids = Array.from(document.head.children);
       const csp = kids[1] as HTMLMetaElement | undefined;
@@ -103,7 +103,7 @@ test.describe('dist CSP：靜態結構與生效對照組', () => {
 
   test('對照組：CSP 確實生效（eval、內嵌腳本、非白名單腳本皆被擋）', async ({ page }) => {
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
 
     // 注意：page.evaluate() 經 CDP 執行，eval 限制不套用於該呼叫本身（實測 new Function 會被放行），
     // 因此改由「頁面自行載入的同源腳本」（script-src 'self' 允許）在頁面正常情境下嘗試 eval。
@@ -156,7 +156,7 @@ test.describe('dist CSP：靜態結構與生效對照組', () => {
 test.describe('dist CSP：頁面載入', () => {
   test('載入零 CSP 違規；3 段 <script> 皆已執行；Service Worker 註冊成功', async ({ page }) => {
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     await page.waitForLoadState('load');
 
     // script #1（theme 初始化）已執行
@@ -181,7 +181,7 @@ test.describe('dist CSP：頁面載入', () => {
 
   test('wasm-unsafe-eval：主執行緒與「真實 blob Worker」內皆可 WebAssembly.instantiate', async ({ page }) => {
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const result = await page.evaluate(async () => {
       const bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]); // 空 wasm 模組
       const main = await WebAssembly.instantiate(bytes).then(() => 'ok').catch((e) => 'FAIL:' + e.message);
@@ -217,7 +217,7 @@ test.describe('dist CSP：ORT-web 的 blob: 動態 import（r4 回歸）', () =>
 
   test('TB-01 主執行緒：import(blob: 模組) 成功，零 CSP 違規', async ({ page }) => {
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const r = await page.evaluate(async (src) => {
       const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
       try { const m = await import(/* @vite-ignore */ url); return { ok: true, answer: m.answer }; }
@@ -230,7 +230,7 @@ test.describe('dist CSP：ORT-web 的 blob: 動態 import（r4 回歸）', () =>
 
   test('TB-02 blob Worker 內：import(blob: 模組) 成功（Worker 繼承文件 CSP；Whisper 的 ORT 就在這裡建後端）', async ({ page }) => {
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const r = await page.evaluate(async (src) => {
       const workerCode = `self.onmessage = async (e) => {
         const url = URL.createObjectURL(new Blob([e.data], { type: 'text/javascript' }));
@@ -251,7 +251,7 @@ test.describe('dist CSP：ORT-web 的 blob: 動態 import（r4 回歸）', () =>
   });
 
   test('TB-03 script-src 只多開 blob:：白名單逐項精確比對（不得出現 unsafe-inline／unsafe-eval／萬用字元）', async ({ page }) => {
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const content = await page.evaluate(
       () => document.querySelector('meta[http-equiv="Content-Security-Policy"]')!.getAttribute('content') || '');
     const scriptSrc = content.split(';').map((d) => d.trim()).find((d) => d.startsWith('script-src ')) ?? '';
@@ -275,7 +275,7 @@ test.describe('dist CSP：ORT-web 的 blob: 動態 import（r4 回歸）', () =>
     const blocked = ['evil.example.com', 'nothf.co', 'hf.co.evil.example.com'];
     for (const h of [...allowed, ...blocked])
       await page.route(`https://${h}/**`, (r) => r.fulfill({ status: 200, headers: { 'access-control-allow-origin': '*' }, body: 'ok' }));
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     // Worker 內的 securitypolicyviolation 事件只會在 Worker 全域觸發（不會冒到頁面 document），所以在 Worker 內自己收
     const { results, violated } = await page.evaluate(async (list) => {
       const code = `const viol = [];
@@ -312,7 +312,7 @@ test.describe('dist：Service Worker 與建置寫入的 CACHE_VERSION', () => {
     expect(m, 'dist/sw.js 的 CACHE_VERSION 應為建置產生的 YYYYMMDD-HHmm').not.toBeNull();
     const cacheName = `whisper-subtitler-${m![1]}`;
 
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     await page.evaluate(() => navigator.serviceWorker.ready);
 
     await expect
@@ -390,7 +390,7 @@ async function installFakes(page: Page) {
 
 /** 選模型、關閉 VAD、上傳檔案、開始辨識 */
 async function startRecognition(page: Page, files: string[]) {
-  await page.goto(DIST_URL);
+  await gotoSettled(page, DIST_URL);
   await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
   // VAD 需從 CDN 載入真實 vad-web/onnxruntime（無法以替身取代），此測試聚焦於 CSP，故關閉
   await page.evaluate(() => {
@@ -477,7 +477,7 @@ test.describe('dist CSP：UVR Worker＋真實 onnxruntime-web', () => {
     const served: string[] = [];
     await routeRealOrt(page, served);
     const w = await attachWatchers(page);
-    await page.goto(DIST_URL);
+    await gotoSettled(page, DIST_URL);
     const model = Array.from(fs.readFileSync(HALF_MODEL_PATH));
     const r = await page.evaluate(async ({ code, model }) => {
       const full = code + "\nself.addEventListener('securitypolicyviolation', (ev) => self.postMessage({ type: 'CSPV', payload: { directive: ev.violatedDirective, blocked: ev.blockedURI } }));";

@@ -135,6 +135,18 @@ async function networkFirst(request) {
   }
 }
 
+// r10：為頁面補上跨來源隔離標頭（GitHub Pages 無法自訂標頭）。
+// 隔離後才有 SharedArrayBuffer，onnxruntime-web 才能多執行緒（一般模式快數倍）。
+// COEP 用 credentialless：jsdelivr／Hugging Face 等跨站資源不需對方加 CORP 標頭也能載入（只是不帶 cookie）。
+// 不支援 credentialless 的瀏覽器（Safari）會忽略這個值 → 不隔離、維持單執行緒，照常可用。
+function withIsolationHeaders(response) {
+  if (!response || response.status === 0 || response.type === 'opaqueredirect') return response;
+  const headers = new Headers(response.headers);
+  headers.set('Cross-Origin-Opener-Policy', 'same-origin');
+  headers.set('Cross-Origin-Embedder-Policy', 'credentialless');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
 async function navigationHandler(request) {
   try {
     const response = await fetch(request);
@@ -142,18 +154,18 @@ async function navigationHandler(request) {
       const cache = await caches.open(CACHE_NAME);
       await cache.put(request, response.clone()); // BUG-3 fix: await
     }
-    return response;
+    return withIsolationHeaders(response);
   } catch {
     // 離線時依序嘗試：精確路徑 → index.html → 根目錄 → 內建離線頁
     const cached =
       (await caches.match(request)) ||
       (await caches.match(`${BASE}/index.html`)) ||
       (await caches.match(`${BASE}/`));
-    if (cached) return cached;
-    return new Response(
+    if (cached) return withIsolationHeaders(cached);
+    return withIsolationHeaders(new Response(
       '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>離線中</title></head>' +
       '<body style="font-family:sans-serif;padding:2rem"><h1>離線中</h1><p>請連線後重試。</p></body></html>',
       { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-    );
+    ));
   }
 }

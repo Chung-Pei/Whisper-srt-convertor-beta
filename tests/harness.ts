@@ -220,3 +220,19 @@ export async function routeRealOrt(page: Page, served: string[] = []) {
   });
   return served;
 }
+
+/** r10：真的 Service Worker 會在第一次開啟時自動重新載入一次（取得跨來源隔離以啟用多核心）。
+ *  允許 SW 的測試在 goto 之後等頁面隔離完成、重新載入結束，避免 evaluate 撞上「Execution context was destroyed」。 */
+export async function waitIsolated(page: Page, timeout = 15_000): Promise<boolean> {
+  const start = Date.now(), end = start + timeout;
+  while (Date.now() < end) {
+    try {
+      if (await page.evaluate(() => self.crossOriginIsolated)) { await page.waitForLoadState('load'); return true; }
+      // 封鎖 SW 的 context（newCtx）：永遠不會隔離，1.2 秒後仍無註冊就直接返回
+      if (Date.now() - start > 1200 && !(await page.evaluate(async () => !!navigator.serviceWorker && !!(await navigator.serviceWorker.getRegistration())))) return false;
+    } catch { /* 正在重新載入 */ }
+    await page.waitForTimeout(200);
+  }
+  return false;
+}
+export async function gotoSettled(page: Page, url: string) { await page.goto(url); await waitIsolated(page); }
