@@ -8,6 +8,8 @@
 //   MT-05  執行緒數規則：未隔離＝1；2 核以下全用；3–4 核＝核心數−1；5 以上＝一半，最多 6；localStorage 覆寫
 //   MT-07  （第 1 輪覆核 M1）舊版 SW（r9，不補標頭）升級：舊版接管時不白白重載；新版接管後自動重新載入一次 → 已隔離
 //   MT-08  （M2）瀏覽器確定不支援時記下，同一瀏覽器開第二個分頁不再重新載入
+//   MT-09  （第 2 輪覆核 S-A）使用者動過畫面（例：改設定、編輯詞典）→ 算忙碌、SW 接管時不自動重新載入
+//   MT-10  （S-B）殘留的「不支援」記號在頁面確實隔離後自動清除
 //   MT-06  隔離後真實 onnxruntime-web 在 Worker 內以 2 條執行緒建立 session 並推論成功（跨站載入的 WASM／執行緒 Worker 不被擋）
 import { test, expect, type Page } from '@playwright/test';
 import fs from 'fs';
@@ -212,6 +214,40 @@ test.describe('r10 多核心運算（跨來源隔離）', () => {
     expect(r.threads).toBe(2);
     expect(r.y0).toBeCloseTo(r.x0 * 0.5, 5);
     expect(served.some((f) => /threaded.*\.wasm$/.test(f)), served.join(', ')).toBe(true);
+    await ctx.close();
+  });
+
+  test('MT-09 使用者動過畫面就不自動重新載入（詞典、設定只在記憶體）', async ({ browser }) => {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    let navs = 0;
+    page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
+    await page.addInitScript(() => {
+      const orig = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      (navigator.serviceWorker as any).register = (u: string, o: any) => new Promise((res) => { (window as any).__goSW = () => res(orig(u, o)); });
+    });
+    await page.goto(BASE_URL);
+    await page.waitForFunction(() => typeof (window as any).__goSW === 'function');
+    expect(await page.evaluate(() => (window as any).__whisperBusy())).toBe(false);
+    await page.locator('body').click({ position: { x: 5, y: 5 } });        // 真實的使用者點擊
+    expect(await page.evaluate(() => (window as any).__whisperBusy())).toBe(true);
+    await page.evaluate(() => (window as any).__goSW());
+    await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 10_000 });
+    await page.waitForTimeout(1500);
+    expect(navs).toBe(1);
+    expect(await page.evaluate(() => (window as any).__coiState)).toBe('busy');
+    await ctx.close();
+  });
+
+  test('MT-10 殘留的「不支援」記號在確實隔離後清除', async ({ browser }) => {
+    const ctx = await browser.newContext();
+    await ctx.addInitScript(() => { if (!sessionStorage.getItem('mt10')) { sessionStorage.setItem('mt10', '1'); localStorage.setItem('whisper-coi-unsupported', navigator.userAgent); } });
+    const page = await ctx.newPage();
+    await page.goto(BASE_URL);
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.reload();                                                       // 已由 SW 接管 → 直接隔離
+    await page.waitForFunction(() => self.crossOriginIsolated === true, null, { timeout: 15_000 });
+    await expect.poll(() => page.evaluate(() => localStorage.getItem('whisper-coi-unsupported'))).toBe(null);
     await ctx.close();
   });
 });

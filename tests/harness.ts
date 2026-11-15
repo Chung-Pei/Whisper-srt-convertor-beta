@@ -231,7 +231,7 @@ export async function waitIsolated(page: Page, timeout = 15_000): Promise<boolea
     try {
       const st = await page.evaluate(() => ({ iso: self.crossOriginIsolated, sw: (window as any).__swState, coi: (window as any).__coiState, hasSW: 'serviceWorker' in navigator }));
       if (st.iso) { await page.waitForLoadState('load'); return true; }
-      if (!st.hasSW || st.sw === 'fail' || st.coi === 'unsupported' || st.coi === 'busy') return false;
+      if (!st.hasSW || st.sw === 'fail' || st.coi === 'unsupported' || st.coi === 'busy' || st.coi === 'not-via-sw') return false;
       if (Date.now() - start > 5000 && !st.sw && !(await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration())))) return false;
     } catch { /* 正在重新載入 */ }
     await page.waitForTimeout(200);

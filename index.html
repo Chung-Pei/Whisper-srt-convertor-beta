@@ -1835,7 +1835,12 @@ let activeIdbCacheKey = null;
 
 let batchQueue    = [];
 // r10：給 Service Worker 註冊腳本（非 module，看不到這裡的變數）判斷能否自動重新載入：處理中或已選檔案時不打斷
-window.__whisperBusy = () => isRunning || batchQueue.length > 0 || !!modelFolderHandle || !!outFolderHandle
+// 第 2 輪覆核 S-A：詞典編輯／匯入、模型與開關設定都只在記憶體 → 使用者動過畫面任何東西就不自動重載
+//（這次維持 1 核，下次開啟 SW 已在補標頭，自然就是多核心）
+let _userTouched = false;
+['input', 'change', 'click', 'drop', 'keydown'].forEach((t) =>
+  document.addEventListener(t, (e) => { if (e.isTrusted) _userTouched = true; }, { capture: true, passive: true }));
+window.__whisperBusy = () => _userTouched || isRunning || batchQueue.length > 0 || !!modelFolderHandle || !!outFolderHandle
   || !!(document.getElementById('initialPrompt') && document.getElementById('initialPrompt').value.trim());
 let _previewNoticeCleanups = [];  // 每次 renderBatchQueue() 重繪前，先清除舊面板遺留的 #outFormat change listener
 let batchIdSeq    = 0;
@@ -2996,20 +3001,35 @@ async function reloadWorkerForRetry(kind, modelId) {
 
 // r10：一般模式（CPU）用了幾個核心——每個 Worker 只說一次
 let _cpuThreadsLogged = null;
+let _cpuWarnPending = null;   // 第 2 輪覆核 S-E：1 核警告等知道後端再說；用顯示卡（GPU）時不說
 function logCpuThreads(n) {
   if (_cpuThreadsLogged === n) return;
   _cpuThreadsLogged = n;
-  if (n > 1) log(`多核心加速：已啟用（一般模式同時用 ${n} 個核心）`, 'ok');
-  else if ((navigator.hardwareConcurrency || 1) <= 1) return;   // 本來就只有 1 個核心：不用提
+  if (n > 1) { _cpuWarnPending = null; log(`多核心加速：已啟用（一般模式同時用 ${n} 個核心）`, 'ok'); return; }
+  if ((navigator.hardwareConcurrency || 1) <= 1) return;   // 本來就只有 1 個核心：不用提
+  _cpuWarnPending = n;
+  if (_lastBackend) flushCpuWarn();
+}
+function flushCpuWarn() {
+  if (_cpuWarnPending === null) return;
+  _cpuWarnPending = null;
+  if (_lastBackend === 'webgpu') return;
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const swOk = !!(navigator.serviceWorker && navigator.serviceWorker.controller) && window.__swState !== 'fail' && window.__coiState !== 'error';
+  if (isIOS)   // 第 2 輪覆核 S-C：iOS 上的 Chrome／Edge 也是同一個核心，換瀏覽器沒用
+    log('iPhone／iPad 的瀏覽器目前只能用 1 個核心（較慢）。長音檔建議在電腦上用 Chrome 或 Edge 處理', 'warn');
   else if (window.__coiUnsupported && window.__coiUnsupported())
     log('這個瀏覽器只能用 1 個核心跑一般模式（較慢）。想更快可改用 Chrome 或 Edge', 'warn');
-  else log('多核心加速尚未啟用：處理完後重新整理頁面即可加快（一般模式目前只用 1 個核心）', 'warn');
+  else if (swOk)   // 第 2 輪覆核 S-D：只有重新整理真的有用時才這樣說
+    log('多核心加速尚未啟用：處理完後重新整理頁面即可加快（一般模式目前只用 1 個核心）', 'warn');
+  else log('這次一般模式只能用 1 個核心（較慢），不影響字幕結果', 'warn');
 }
 
 /** Worker 回報實際後端時：記下後端並更新畫面（首次載入與重試重載共用，避免重載後畫面仍顯示舊的 GPU 標示） */
 
 function applyBackendInfo(x) {
   _lastBackend = x.backend ?? null;
+  flushCpuWarn();
   if (x.reason === 'gpu-weights-offline')
     log(`目前沒有網路，顯示卡模式需要的模型檔還沒下載過，改用電腦裡已有的一般模式模型（${x.dtype}）`, 'warn');
   const isGpu = x.backend === 'webgpu';
@@ -7353,12 +7373,20 @@ async function maybeReloadForIsolation() {
   if (_coiChecking) { _coiAgain = true; return; }   // 檢查中又遇到 SW 換手：檢查完再判斷一次
   _coiChecking = true;
   try {
-    if (window.crossOriginIsolated) { sessionStorage.removeItem(COI_RELOAD_KEY); window.__coiState = 'isolated'; return; }
+    if (window.crossOriginIsolated) {
+      sessionStorage.removeItem(COI_RELOAD_KEY);
+      try { localStorage.removeItem(COI_UNSUPPORTED_KEY); } catch (e) {}   // 第 2 輪覆核 S-B：記號會自我修正
+      window.__coiState = 'isolated'; return;
+    }
     const ctrl = navigator.serviceWorker.controller;
     if (!window.isSecureContext || !ctrl) return;
     if (window.__coiUnsupported()) { window.__coiState = 'unsupported'; return; }
     if (!(await pingIsolationSW(ctrl))) { window.__coiState = 'old-sw'; return; }
     if (navigator.serviceWorker.controller !== ctrl || window.crossOriginIsolated) return;
+    // 第 2 輪覆核 S-B：只有「這次載入確實經過 SW」才判定不支援，避免非 SW 回應的載入被誤判
+    const nav = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+    const viaSW = !nav || !('workerStart' in nav) || nav.workerStart > 0;
+    if (sessionStorage.getItem(COI_RELOAD_KEY) && !viaSW) { window.__coiState = 'not-via-sw'; return; }   // 這分頁試過了：不再重載
     if (sessionStorage.getItem(COI_RELOAD_KEY)) {
       // 已經由新版 SW 重新載入過仍未隔離 → 這個瀏覽器不支援
       try { localStorage.setItem(COI_UNSUPPORTED_KEY, navigator.userAgent); } catch (e) {}
