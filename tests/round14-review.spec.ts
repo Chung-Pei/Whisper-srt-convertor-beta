@@ -33,6 +33,7 @@ async function openAndPickModel(page: Page) {
   await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
 }
 
+// r10b：相鄰語音段會打包成 ≤30 秒的視窗；這裡三段彼此相隔 >30 秒，各自成一個視窗。
 // 每個 VAD 語音段各回一個「段首字」（相對時間 0.5s）與一個「段中字」（相對 6s）
 const headWords = (tag: string): Seg => [
   { text: `${tag}HEAD`, timestamp: [0.5, 1.0] },
@@ -47,7 +48,7 @@ test.describe('r7 審查：VAD', () => {
     await openAndPickModel(page);
     await setToggles(page, ['tog_vad'], ['tog_diarization', 'tog_uvr']);
     await page.evaluate(() => { (document.getElementById('p_vad_threshold') as HTMLInputElement).value = '0.02'; });   // 讓原版 RMS 備援也能偵測到語音（隔離「吃字」這個缺陷）
-    await page.locator('#fileInput').setInputFiles({ name: 'vad.wav', mimeType: 'audio/wav', buffer: makeWav(30, [[1, 4], [8, 12], [20, 23]]) });
+    await page.locator('#fileInput').setInputFiles({ name: 'vad.wav', mimeType: 'audio/wav', buffer: makeWav(100, [[1, 4], [40, 44], [80, 83]]) });
     await page.locator('#startBtn').click();
     await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
     const log = await page.locator('#logBox').innerText();
@@ -64,7 +65,7 @@ test.describe('r7 審查：VAD', () => {
     await openAndPickModel(page);
     await setToggles(page, ['tog_vad'], ['tog_diarization', 'tog_uvr']);
     expect(await page.locator('#p_vad_threshold').inputValue()).toBe('0.5');
-    await page.locator('#fileInput').setInputFiles({ name: 'vad.wav', mimeType: 'audio/wav', buffer: makeWav(30, [[1, 4], [8, 12], [20, 23]]) });
+    await page.locator('#fileInput').setInputFiles({ name: 'vad.wav', mimeType: 'audio/wav', buffer: makeWav(100, [[1, 4], [40, 44], [80, 83]]) });
     await page.locator('#startBtn').click();
     await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
     const log = await page.locator('#logBox').innerText();

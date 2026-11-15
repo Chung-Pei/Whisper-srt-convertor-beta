@@ -937,6 +937,13 @@
   }
   .preview-media-wrap.audio-mode audio { position: absolute; left: 6px; right: 6px; bottom: 6px; width: calc(100% - 12px); }
   .preview-media-wrap video, .preview-media-wrap audio { display: block; width: 100%; }
+  /* r10b：鬼打牆重試後仍可疑的段落——只在網頁預覽標出（淡黃底），匯出字幕不加記號 */
+  .preview-review { margin-top: 0.6rem; padding: 0.55rem 0.7rem; border-radius: var(--radius); background: rgba(250, 204, 21, 0.12); border: 1px solid rgba(250, 204, 21, 0.45); font-size: 0.78rem; color: var(--text); }
+  .preview-review-title { font-weight: 600; margin-bottom: 0.35rem; }
+  .preview-review-item { display: flex; gap: 0.5rem; align-items: center; width: 100%; min-height: 32px; padding: 0.3rem 0.4rem; margin-top: 0.2rem; background: transparent; border: 1px solid rgba(250, 204, 21, 0.35); border-radius: 6px; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+  .preview-review-item:hover, .preview-review-item:focus-visible { background: rgba(250, 204, 21, 0.2); }
+  .preview-review-time { font-family: 'IBM Plex Mono', monospace; font-weight: 600; white-space: nowrap; }
+  .preview-overlay.needs-check::after { content: '此段可能漏字，建議重聽'; display: block; margin: 0.3em auto 0; width: fit-content; padding: 0.1em 0.5em; font-size: 0.6em; border-radius: 4px; background: rgba(250, 204, 21, 0.9); color: #222; text-shadow: none; }
   .preview-overlay {
     position: absolute;
     left: 4%;
@@ -1523,8 +1530,8 @@
         <option value="en">English</option>
         <option value="ja">日本語</option>
         <option value="ko">한국어</option>
-        <option value="">自動偵測</option>
       </select>
+      <!-- r10b b8：移除「自動偵測」——目前使用的 Transformers.js 4.3.0 沒有語言偵測，選它其實會當成英文辨識，中文課會變成英文或亂碼 -->
     </div>
     <div class="opt-group">
       <label>任務</label>
@@ -1550,6 +1557,10 @@
         <div>開啟下方「醫學專有名詞標注」時，會自動加上免疫學、微生物學常用英文名詞（如 antibody、IgG、MHC、Staphylococcus aureus）與詞典裡的英文名詞，不用自己打。若模型把提示詞原文照抄進字幕，會自動刪除並在完成時告訴你。</div>
       </details>
     </div>
+    <label id="shortPromptRow" style="display:flex;align-items:center;gap:0.5rem;margin-top:0.45rem;font-size:0.72rem;color:var(--muted);cursor:pointer;min-height:24px;">
+      <input type="checkbox" id="tog_short_prompt" style="width:18px;height:18px;">
+      沒有顯示卡時用短提示詞（轉得較快，但自動加入的醫學名詞較少）
+    </label>
   </div>
 
   <div class="section-title">輸出設定</div>
@@ -1994,7 +2005,8 @@ async function importTransformers() {
 //   [<|startofprev|>, …提示詞 token（最多 200 個，超過時保留最後面的）…, <|startoftranscript|>, <|語言|>, <|任務|>, (<|notimestamps|>)]
 // 以下函式會以 toString() 原樣注入 Worker（不可引用外部變數、不可用反引號）。
 const PROMPT_MAX_TOKENS = 200;
-const RESUME_SAVE_EVERY = 5;   // r9：斷點續傳每 5 段寫一次
+const RESUME_SAVE_EVERY = 5;
+const PROMPT_SHORT_TOKENS = 80;  // r10b b3：一般模式短提示詞（選項，預設關；尚未用真實課程 A/B 驗證名詞準確度）   // r9：斷點續傳每 5 段寫一次
 
 // 使用者指定（2026-11-14）：提示詞以「免疫學＋微生物學」名詞為主。這份清單一定放在詞典其他名詞之後、使用者提示詞之前，
 // 超過 200 token 截斷時（保留最後面）優先留下；越後面越重要。約 150 token，留空間給使用者提示詞。
@@ -2040,6 +2052,122 @@ function buildPromptDecoderIds(promptIds, initTokens, prevSotId, maxTokens, firs
   const kept = lim > 0 ? clean.slice(-lim) : [];
   if (kept.length === 0) return null;
   return [Number(prevSotId)].concat(kept, initTokens.map(Number));
+}
+
+// ── r10b：加速（拿掉 seek 重算、鬼打牆提早停止）──────────────────────────────
+// 以下純函式同樣以 toString() 注入 Worker（不可引用外部變數、不可用反引號）。
+const WHISPER_MAX_TARGET = 448;   // whisper 解碼器最多 448 個位置（起始序列＋新 token 合計）
+
+/** 純函式：只看「起始序列之後新生成的 token」判斷是否鬼打牆。回傳原因字串或 null。
+ *  門檻刻意保守，老師真的重複（「對、對、對」「IgG、IgG」）不會被誤停：
+ *   - 同一個 token 連續 ≥12 次
+ *   - 最後 k 個 token（k=2～3）連續重複 ≥5 次；k=4～8 連續重複 ≥4 次
+ *   - 新 token 數超過這段音訊合理上限（每秒 12 個，至少 48 個） */
+function detectTokenLoop(newIds, audioSec, totalNew) {
+  const a = newIds || []; const n = a.length;
+  if (n === 0) return null;
+  const budget = Math.max(48, Math.ceil((audioSec > 0 ? audioSec : 30) * 12));
+  if ((totalNew > n ? totalNew : n) > budget) return 'budget';
+  let run = 1;
+  for (let i = n - 2; i >= 0 && a[i] === a[n - 1]; i--) run++;
+  if (run >= 12) return 'repeat1';
+  for (let k = 2; k <= 8; k++) {
+    const need = k <= 3 ? 5 : 4;
+    if (n < k * need) continue;
+    let mixed = false;   // 單一 token 連續重複交給上面 repeat1（≥12）判斷，這裡只看「多個 token 組成的片語」
+    for (let j = 1; j < k; j++) { if (a[n - 1 - j] !== a[n - 1]) { mixed = true; break; } }
+    if (!mixed) continue;
+    let ok = true;
+    for (let r = 1; r < need && ok; r++) {
+      for (let j = 0; j < k; j++) { if (a[n - 1 - j] !== a[n - 1 - j - r * k]) { ok = false; break; } }
+    }
+    if (ok) return 'repeat' + k;
+  }
+  return null;
+}
+
+/** 純函式：鬼打牆停下後，把字幕尾端「一模一樣重複 ≥3 次」的片段只留第一次。回傳 { chunks, removed }。 */
+function trimRepeatTail(chunks) {
+  const c = Array.isArray(chunks) ? chunks.slice() : [];
+  const norm = function (x) { return String((x && x.text) || '').replace(/[\s，,、。.！!？?]/g, ''); };
+  let removed = 0;
+  for (let guard = 0; guard < 4; guard++) {
+    let best = null;
+    for (let k = 1; k <= 8; k++) {
+      if (c.length < k * 3) break;
+      let reps = 1;
+      while (c.length >= k * (reps + 1)) {
+        let same = true;
+        for (let j = 0; j < k; j++) { if (norm(c[c.length - 1 - j]) !== norm(c[c.length - 1 - j - reps * k])) { same = false; break; } }
+        if (!same) break;
+        reps++;
+      }
+      const unit = c.slice(c.length - k).map(norm).join('');
+      if (reps >= 3 && unit.length > 0 && (!best || (reps - 1) * k > best.drop)) best = { drop: (reps - 1) * k };
+    }
+    if (!best) break;
+    c.splice(c.length - best.drop, best.drop);
+    removed += best.drop;
+  }
+  return { chunks: c, removed: removed };
+}
+
+/** 純函式：依（可能有的）VAD 語音段規劃辨識視窗。回傳 [{ startSec, endSec, leadSec }]。
+ *  r10b c1：相鄰語音段打包成最長 chunkSec 的一個視窗（中間的短停頓原樣保留，時間軸不用換算），
+ *  不再把每一小段語音各自補成 30 秒跑一次模型。超過 chunkSec 的長段才用重疊切分（接續視窗 leadSec = strideSec）。 */
+function planChunkWindows(totalSec, speechSegs, chunkSec, strideSec) {
+  const out = [];
+  const T = Math.max(0, totalSec || 0);
+  const cs = chunkSec || 30, ss = strideSec || 5;
+  const split = function (s, e) {
+    let off = s;
+    while (off < e - 1e-6) {
+      const end = Math.min(off + cs, e);
+      out.push({ startSec: off, endSec: end, leadSec: off === s ? 0 : ss });
+      if (end >= e - 1e-6) break;
+      off += cs - ss;
+    }
+  };
+  if (!Array.isArray(speechSegs) || speechSegs.length === 0) { split(0, T); return out; }
+  let cur = null;
+  const flush = function () {
+    if (!cur) return;
+    if (cur.end - cur.start <= cs + 1e-6) out.push({ startSec: cur.start, endSec: cur.end, leadSec: 0 });
+    else split(cur.start, cur.end);
+    cur = null;
+  };
+  for (const sg of speechSegs) {
+    const s = Math.max(0, Math.min(T, sg.start)), e = Math.max(s, Math.min(T, sg.end));
+    if (e - s <= 0) continue;
+    if (cur && e - cur.start <= cs + 1e-6) cur.end = Math.max(cur.end, e);
+    else { flush(); cur = { start: s, end: e }; }
+  }
+  flush();
+  return out;
+}
+
+/** 純函式：剩餘時間預估（r10b f）。用最近 window 段的「每秒音訊花幾秒」平均，不含模型載入與暖機。
+ *  samples: [{ audioSec, ms }]（依完成順序）；回傳 { remainSec, secPerAudioSec } 或 null（資料不足）。 */
+function estimateRemaining(samples, remainingAudioSec, windowN) {
+  const w = windowN || 8;
+  const s = (samples || []).filter(function (x) { return x && x.audioSec > 0 && x.ms > 0; });
+  if (s.length === 0) return null;
+  const recent = s.length > 1 ? s.slice(1).slice(-w) : s;   // 第一段常含暖機，有兩段以上就不算它
+  let a = 0, m = 0;
+  for (const x of recent) { a += x.audioSec; m += x.ms; }
+  if (a <= 0) return null;
+  const spa = m / 1000 / a;
+  return { remainSec: Math.max(0, remainingAudioSec) * spa, secPerAudioSec: spa };
+}
+
+/** 白話時間：「約 12 分鐘」「不到 1 分鐘」「約 1 小時 20 分」 */
+function plainDuration(sec) {
+  if (!(sec >= 0)) return '';
+  if (sec < 60) return '不到 1 分鐘';
+  const m = Math.round(sec / 60);
+  if (m < 60) return '約 ' + m + ' 分鐘';
+  const h = Math.floor(m / 60), r = m % 60;
+  return '約 ' + h + ' 小時' + (r ? ' ' + r + ' 分' : '');
 }
 
 /** 移除模型把提示詞原文「照抄」進字幕的片段（Whisper 常見幻覺）。
@@ -2111,8 +2239,14 @@ const PROMPT_MAX_TOKENS = ${PROMPT_MAX_TOKENS};
 ${buildPromptDecoderIds.toString()}
 ${stripPromptLeak.toString()}
 ${promptDecoderIdsForPipe.toString()}
+// r10b：加速相關純函式
+const WHISPER_MAX_TARGET = ${WHISPER_MAX_TARGET};
+${detectTokenLoop.toString()}
+${trimRepeatTail.toString()}
 
 let pipelineFn    = null;
+let StoppingCriteriaCls = null;   // r10b：自訂停止條件（鬼打牆）
+const _sessStats = { enc: 0, dec: 0, encMs: 0, decMs: 0 };   // r10b：量測（每段歸零）
 let ModelRegistry = null;   // v4 新增
 let envRef        = null;
 let pipe          = null;
@@ -2311,6 +2445,7 @@ async function loadLib() {
   const wasmThreads = wasmThreadCount();
   self.postMessage({ type: 'LIB_VERSION', payload: { version: '${HF_TRANSFORMERS_VERSION}' + (fallback ? '-fallback' : ''), threads: wasmThreads, isolated: !!self.crossOriginIsolated } });
   pipelineFn    = mod.pipeline;
+  StoppingCriteriaCls = mod.StoppingCriteria || null;
   ModelRegistry = mod.ModelRegistry ?? null;  // v4 才有
   envRef        = mod.env;
   if (envRef) {
@@ -2449,6 +2584,81 @@ async function _pickWasmDtype(payload) {
 
 let _chunkCounter = 0;
 
+// r10b：包裝 ONNX session.run 計算每段的編碼器／解碼器次數與耗時（只計數，不改結果）
+function _instrumentSessions(p) {
+  try {
+    const sessions = p && p.model && p.model.sessions;
+    if (!sessions) return;
+    for (const name of Object.keys(sessions)) {
+      const sess = sessions[name];
+      if (!sess || typeof sess.run !== 'function' || sess.__r10bWrapped) continue;
+      const orig = sess.run.bind(sess);
+      const isEnc = /encoder|^model$/.test(name) && !/decoder/.test(name);
+      sess.run = async function () {
+        const t = performance.now();
+        try { return await orig.apply(null, arguments); }
+        finally {
+          const d = performance.now() - t;
+          if (isEnc) { _sessStats.enc++; _sessStats.encMs += d; } else { _sessStats.dec++; _sessStats.decMs += d; }
+        }
+      };
+      sess.__r10bWrapped = true;
+    }
+  } catch (_) {}
+}
+
+/** r10b：起始序列長度（提示詞＋語言／任務 token）。拿不到時用 4 估。 */
+function _prefixLen(p, language, task, decoderIds) {
+  if (Array.isArray(decoderIds) && decoderIds.length) return decoderIds.length;
+  try {
+    const m = p && p.model;
+    if (m && typeof m._prepare_generation_config === 'function' && typeof m._retrieve_init_tokens === 'function') {
+      const gc = m._prepare_generation_config(null, { language: language, task: task, return_timestamps: true });
+      const init = m._retrieve_init_tokens(gc);
+      if (Array.isArray(init) && init.length) return init.length;
+    }
+  } catch (_) {}
+  return 4;
+}
+
+/** r10b：Transformers.js 4.3.0 的 Whisper generate() 會把呼叫端給的 stopping_criteria 丟掉（沒有往下傳），
+ *  所以改成「這一次呼叫期間」暫時包住 model._get_stopping_criteria，把我們的停止條件加進清單，呼叫完就還原。 */
+async function _runWithStop(stop, fn) {
+  const m = pipe && pipe.model;
+  if (!stop || !m || typeof m._get_stopping_criteria !== 'function') return fn();
+  const own = Object.prototype.hasOwnProperty.call(m, '_get_stopping_criteria');
+  const prev = m._get_stopping_criteria;
+  m._get_stopping_criteria = function (gc, sc) { const list = prev.call(this, gc, sc); try { list.push(stop); } catch (_) {} return list; };
+  try { return await fn(); }
+  finally { if (own) m._get_stopping_criteria = prev; else delete m._get_stopping_criteria; }
+}
+
+/** r10b：鬼打牆停止條件（只看起始序列之後的新 token）；同時記錄新 token 數與最後一個 token。 */
+function _makeLoopStop(prefixLen, audioSec) {
+  if (!StoppingCriteriaCls) return null;
+  class LoopStop extends StoppingCriteriaCls {
+    constructor() { super(); this.reason = null; this.newTokens = 0; this.last = null; }
+    _call(input_ids) {
+      const out = [];
+      for (const ids of input_ids) {
+        const n = ids.length - prefixLen;
+        if (n > this.newTokens) this.newTokens = n;
+        this.last = ids.length ? Number(ids[ids.length - 1]) : null;
+        let stop = false;
+        if (n >= 8) {
+          const tail = []; const from = Math.max(prefixLen, ids.length - 64);
+          for (let i = from; i < ids.length; i++) tail.push(Number(ids[i]));
+          const why = detectTokenLoop(tail, audioSec, n);   // 只看最後 64 個，預算用全部新 token 數
+          if (why) { stop = true; if (!this.reason) this.reason = why; }
+        }
+        out.push(stop);
+      }
+      return out;
+    }
+  }
+  return new LoopStop();
+}
+
 self.addEventListener('message', async (e) => {
   const { type, payload } = e.data;
 
@@ -2510,6 +2720,7 @@ self.addEventListener('message', async (e) => {
       const progress_callback = (x) => self.postMessage({ type: 'PROGRESS', payload: x });
       try {
         pipe = await pipelineFn('automatic-speech-recognition', payload.modelId, { dtype, device, progress_callback });
+        _instrumentSessions(pipe);
       } catch (gpuErr) {
         // r9-fix：模型檔內容損壞（JSON 解析失敗、空內容）與顯示卡無關，不可降級成一般模式。
         // 先清掉瀏覽器快取裡這個模型的檔案，回報 MODEL_FILE_CORRUPT，由主執行緒換新 Worker 重新下載一次。
@@ -2545,7 +2756,11 @@ self.addEventListener('message', async (e) => {
       }
 
       const { audioData, language, task, promptText, segIdx, startSec } = payload;
+      const promptMax = payload.promptMaxTokens > 0 ? payload.promptMaxTokens : PROMPT_MAX_TOKENS;
       const f32 = new Float32Array(audioData);
+      const audioSec = f32.length / 16000;
+      const t0 = performance.now();
+      _sessStats.enc = 0; _sessStats.dec = 0; _sessStats.encMs = 0; _sessStats.decMs = 0;
 
       // 產出 result.chunks 每個元素含逐字 timestamp，後處理可進一步細分
       const callOpts = { language, task, return_timestamps: 'word' };
@@ -2553,11 +2768,60 @@ self.addEventListener('message', async (e) => {
       // 改為直接給 decoder_input_ids = [<|startofprev|>, 提示詞…, <|startoftranscript|>, 語言, 任務]。
       if (promptText) {
         let info = null;
-        try { info = promptDecoderIdsForPipe(pipe, promptText, language, task, PROMPT_MAX_TOKENS); } catch (pe) { info = { ids: null, reason: String(pe && pe.message || pe) }; }
+        try { info = promptDecoderIdsForPipe(pipe, promptText, language, task, promptMax); } catch (pe) { info = { ids: null, reason: String(pe && pe.message || pe) }; }
         if (info && info.ids) callOpts.decoder_input_ids = info.ids;
         self.postMessage({ type: 'PROMPT_INFO', payload: { used: info && info.used, total: info && info.total, reason: info && info.reason, segIdx: segIdx } });
       }
-      let result = await pipe(f32, callOpts);
+      // r10b b1：給滿剩餘空間的 max_new_tokens → Transformers.js 4.3.0 跳過 seek 迴圈（不再把視窗尾巴補零成 30 秒重算一次）。
+      // 視窗邊界改由主執行緒在重疊區中點切開處理。b2：鬼打牆停止條件只看新 token（不會懲罰提示詞裡的醫學名詞）。
+      const prefixLen = _prefixLen(pipe, language, task, callOpts.decoder_input_ids);
+      const maxNew = Math.max(16, WHISPER_MAX_TARGET - prefixLen - 1);
+      const loopStop = _makeLoopStop(prefixLen, audioSec);
+      const fastOpts = Object.assign({}, callOpts, { max_new_tokens: maxNew });
+      let mode = 'fast';
+      let result = await _runWithStop(loopStop, function () { return pipe(f32, fastOpts); });
+      let eosId = null;
+      try { const g = pipe.model && pipe.model.generation_config; eosId = g ? (Array.isArray(g.eos_token_id) ? g.eos_token_id[0] : g.eos_token_id) : null; } catch (_) {}
+      // 這段話太密、用完 token 空間卻還沒講完（不是鬼打牆）→ 這一段改用原本的完整模式（seek）重跑一次，避免尾端漏字
+      if (loopStop && !loopStop.reason && loopStop.newTokens >= maxNew && (eosId == null || loopStop.last !== Number(eosId))) {
+        mode = 'seek-retry';
+        result = await pipe(f32, callOpts);
+      }
+      // r10b 鬼打牆處理（使用者 2026-11-15 規格）：只停這一段的迴圈 → 截掉重複尾巴 → 有提示詞時不帶提示詞重試一次
+      // → 重試沒有迴圈且內容不比較少就採用；仍可疑才標記（只在網頁預覽標出，匯出字幕不加任何記號）。整體轉檔不中斷。
+      const textLen = function (r) { return r && Array.isArray(r.chunks) ? r.chunks.map(function (c) { return c.text || ''; }).join('').replace(/ /g, '').length : 0; };
+      const trimLoop = function (r) {
+        if (!r || !Array.isArray(r.chunks)) return 0;
+        const tr = trimRepeatTail(r.chunks);
+        if (tr.removed > 0) { r.chunks = tr.chunks; r.text = tr.chunks.map(function (c) { return c.text; }).join(''); }
+        return tr.removed;
+      };
+      let loopTrimmed = 0, retried = false, retryOk = false, flagged = false;
+      const loopReason = loopStop ? loopStop.reason : null;
+      if (loopReason) {
+        loopTrimmed = trimLoop(result);
+        if (callOpts.decoder_input_ids) {
+          retried = true;
+          const plainOpts = Object.assign({}, callOpts); delete plainOpts.decoder_input_ids;
+          const pLen = _prefixLen(pipe, language, task, null);
+          const stop2 = _makeLoopStop(pLen, audioSec);
+          const retryOpts = Object.assign({}, plainOpts, { max_new_tokens: Math.max(16, WHISPER_MAX_TARGET - pLen - 1) });
+          let r2 = null;
+          try { r2 = await _runWithStop(stop2, function () { return pipe(f32, retryOpts); }); } catch (_) { r2 = null; }
+          // 重試沒有迴圈、且內容沒有明顯變少（截短版仍可能夾著一次重複片語，所以不要求更長）→ 採用
+          if (r2 && stop2 && !stop2.reason && textLen(r2) > 0 && textLen(r2) >= 0.6 * textLen(result)) { result = r2; retryOk = true; }
+        }
+        flagged = !retryOk;
+      }
+      let keptEnd = 0;
+      try { const cs = (result && result.chunks) || []; for (const c of cs) { if (c.timestamp && c.timestamp[1] != null && c.timestamp[1] > keptEnd) keptEnd = c.timestamp[1]; } } catch (_) {}
+      const stats = {
+        ms: Math.round(performance.now() - t0), audioSec: audioSec, enc: _sessStats.enc, dec: _sessStats.dec,
+        encMs: Math.round(_sessStats.encMs), decMs: Math.round(_sessStats.decMs),
+        newTokens: loopStop ? loopStop.newTokens : null, loop: loopReason, loopTrimmed: loopTrimmed, mode: mode,
+        retried: retried, retryOk: retryOk, flagged: flagged,
+        lostSec: flagged ? Math.max(0, Math.round((audioSec - keptEnd) * 10) / 10) : 0, keptEnd: keptEnd,
+      };
       if (promptText && result && Array.isArray(result.chunks)) {
         const st = stripPromptLeak(result.chunks, promptText);
         if (st.removed > 0) {
@@ -2567,7 +2831,7 @@ self.addEventListener('message', async (e) => {
         }
       }
 
-      self.postMessage({ type: 'CHUNK_DONE', payload: { result, segIdx, startSec } });
+      self.postMessage({ type: 'CHUNK_DONE', payload: { result, segIdx, startSec, stats } });
       result = null;
 
       // 每處理完 10 個 chunks，讓出 Event Loop 以便 GC
@@ -3499,18 +3763,31 @@ function setProgress(pct, label, indet = false) {
 
 function formatEtaSec(s) { return s < 60 ? `${Math.round(s)}s` : `${Math.floor(s/60)}m${Math.round(s%60)}s`; }
 
-function updateEta(processedAudioSec, totalAudioSec) {
+/** r10b f：剩餘時間改用最近幾段的平均速度（不含模型載入），白話顯示。est = estimateRemaining(...) 的結果或 null。 */
+function updateEta(est) {
   if (!progEta) return;
-  if (processedAudioSec <= 0 || totalAudioSec <= 0) { progEta.classList.remove('show'); return; }
-  const elapsed   = (Date.now() - _inferStart) / 1000;
-  const rate      = processedAudioSec / elapsed;
-  const remaining = (totalAudioSec - processedAudioSec) / rate;
-  const rtf       = elapsed / processedAudioSec;
+  if (!est || !(est.remainSec >= 0)) { progEta.classList.remove('show'); return; }
+  const perMin = Math.max(1, Math.round(est.secPerAudioSec * 60));
   progEta.classList.add('show');
   progEta.innerHTML =
-    `<span>&#x23F1; 剩餘：<strong style="color:var(--text)">${formatEtaSec(remaining)}</strong></span>` +
-    `<span>速度：<strong style="color:var(--text)">${rate.toFixed(1)}&times; 實時</strong></span>` +
-    `<span>RTF：<strong style="color:var(--text)">${rtf.toFixed(2)}</strong></span>`;
+    `<span>&#x23F1; 剩餘：<strong style="color:var(--text)">${plainDuration(est.remainSec)}</strong></span>` +
+    `<span>速度：每 1 分鐘音訊約 <strong style="color:var(--text)">${perMin} 秒</strong></span>`;
+}
+
+/** r10b：一段的量測紀錄（白話＋技術數字），例如「段落 3：30 秒音訊花 8.2 秒（模型讀音訊 1 次、產生 152 個字詞單位）」 */
+function formatSegStats(n, st) {
+  const parts = [];
+  if (st.enc != null) parts.push(`模型讀音訊 ${st.enc} 次`);
+  if (st.newTokens != null) parts.push(`產生 ${st.newTokens} 個字詞單位`);
+  let extra = '';
+  if (st.loop) {
+    extra += st.loop === 'budget' ? '；這段產生的字異常多（可能一直重複），已提早停止' : '；這段一直重複同一個詞，已提早停止';
+    if (st.loopTrimmed) extra += `、截掉 ${st.loopTrimmed} 個重複字詞`;
+    if (st.retried) extra += st.retryOk ? '；不帶提示詞重試一次：成功，已採用重試結果' : '；不帶提示詞重試一次：仍不理想，保留截短後的版本';
+    if (st.flagged) extra += `；已標記待確認${st.lostSec ? `（後面約 ${st.lostSec} 秒可能漏字）` : ''}`;
+  }
+  if (st.mode === 'seek-retry') extra += '；這段話很密，已用完整模式重跑一次';
+  return `⏲ 段落 ${n}：${(st.audioSec || 0).toFixed(1)} 秒音訊花 ${(st.ms / 1000).toFixed(1)} 秒（${parts.join('、')}）${extra}`;
 }
 
 function resetEta() {
@@ -3995,6 +4272,25 @@ function buildPreviewPanel(item) {
     </div>
     <div class="preview-format-notice"></div>
   `;
+  // r10b：待確認清單（點一下跳到該時間播放）
+  const marks = Array.isArray(item.reviewMarks) ? item.reviewMarks : [];
+  if (marks.length) {
+    const box = document.createElement('div');
+    box.className = 'preview-review';
+    const title = document.createElement('div');
+    title.className = 'preview-review-title';
+    title.textContent = `有 ${marks.length} 段可能漏字，點一下就能跳過去重聽確認（字幕檔裡不會有任何記號）`;
+    box.appendChild(title);
+    marks.forEach((m, k) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'preview-review-item'; b.dataset.idx = String(k);
+      const t = document.createElement('span'); t.className = 'preview-review-time'; t.textContent = fmtTime(m.startSec).slice(0, 8);
+      const r = document.createElement('span'); r.textContent = m.reason;
+      b.append(t, r);
+      box.appendChild(b);
+    });
+    panel.appendChild(box);
+  }
   return panel;
 }
 
@@ -4024,8 +4320,18 @@ function bindPreviewPanelEvents(item, panel) {
   updatePreviewOverlayStyle(item, overlayEl);
   updatePreviewNotice(noticeEl);
 
+  const marks = Array.isArray(item.reviewMarks) ? item.reviewMarks : [];
   mediaEl.addEventListener('timeupdate', () => {
-    overlayEl.textContent = findActiveChunkText(item.chunks, mediaEl.currentTime);
+    const t = mediaEl.currentTime;
+    overlayEl.textContent = findActiveChunkText(item.chunks, t);
+    overlayEl.classList.toggle('needs-check', marks.some((m) => t >= m.startSec && t <= m.endSec));
+  });
+  panel.querySelectorAll('.preview-review-item').forEach((b) => {
+    b.addEventListener('click', () => {
+      const m = marks[Number(b.dataset.idx)];
+      if (!m) return;
+      try { mediaEl.currentTime = Math.max(0, m.startSec); const pp = mediaEl.play(); if (pp && pp.catch) pp.catch(() => {}); } catch (_) {}
+    });
   });
 
   fsSlider.addEventListener('input', () => {
@@ -4346,11 +4652,18 @@ async function decodeAudio(file, mono16k = null) {
     try {
       // 若 Diarization 啟用，先保留 mono 副本（最多 10 分鐘音訊 @ 16kHz）
       if (diarWillRun && mono) monoSnapshot = mono.slice(0, Math.min(mono.length, MAX_DIAR_SAMPLES));
+      // r10b c2：大檔原本完全沒跑 VAD（VAD 開關形同虛設）。趁整段音訊還在記憶體（存入 IndexedDB 之前）先找出語音段。
+      let speechSegs = null;
+      if (document.getElementById('tog_vad')?.checked) {
+        try { speechSegs = await runVadForPlan(mono); }
+        catch (ve) { if (ve?.message === 'CANCELLED') throw ve; log(`⚠ VAD 失敗（${ve?.message ?? ve}），改為全段處理`, 'warn'); }
+        if (isCancelled) throw new Error('CANCELLED');
+      }
       const { shardCount, totalSamples } = await storeAudioInIDB(cacheKey, mono);
       mono = null;
       log(`✓ 已分 ${shardCount} 片儲存至 IndexedDB`, 'ok');
       activeIdbCacheKey = cacheKey;
-      return { audio: { type: 'idb', cacheKey, totalSamples, shardCount }, monoSnapshot };
+      return { audio: { type: 'idb', cacheKey, totalSamples, shardCount, speechSegs }, monoSnapshot };
     } catch (e) {
       if (e.message === 'CANCELLED') throw e;
       log('⚠ IndexedDB 儲存失敗，降級使用記憶體模式處理大檔案', 'warn');
@@ -4513,112 +4826,85 @@ function runVAD_rms(samples, sampleRate = SR, threshold = RMS_VAD_THRESHOLD) {
   if (inSpeech) segments.push({ start: segStart, end: samples.length / sampleRate });
   return mergeCloseSegments(segments);
 }
-async function* audioChunkGenerator(audioOrDesc, sampleRate = SR, chunkSec = 30, strideSec = 5) {
-  const chunkLen  = chunkSec  * sampleRate;
-  const strideLen = strideSec * sampleRate;
-
-  if (audioOrDesc instanceof Float32Array) {
-    // ── VAD 路徑：只對有語音的段落切片 ──────────────────────────
-    const useVAD = document.getElementById('tog_vad')?.checked;
-    if (useVAD) {
-      const uiThreshold = parseFloat(document.getElementById('p_vad_threshold')?.value);
-      const sileroThreshold = uiThreshold >= 0.1 && uiThreshold <= 0.9 ? uiThreshold : SILERO_VAD_THRESHOLD;
-      const speechSegs = await runVAD(audioOrDesc, sampleRate, sileroThreshold);
-      const totalSamples = audioOrDesc.length;
-
-      if (speechSegs.length === 0) {
-        log('⚠ VAD：未偵測到語音段落，降級為全段處理', 'warn');
-        // fallback：走全段路徑
-      } else {
-        const speechDur = speechSegs.reduce((acc, s) => acc + (s.end - s.start), 0);
-        const totalDur  = totalSamples / sampleRate;
-        log(`✓ VAD：偵測到 ${speechSegs.length} 個語音段（${speechDur.toFixed(1)}s / ${totalDur.toFixed(1)}s = ${Math.round(speechDur/totalDur*100)}%）`, 'ok');
-
-        for (const seg of speechSegs) {
-          const startSample = Math.floor(seg.start * sampleRate);
-          const endSample   = Math.min(Math.ceil(seg.end * sampleRate), totalSamples);
-          const segLen      = endSample - startSample;
-
-          // 若此語音段比 chunkLen 短，直接當一個 chunk
-          if (segLen <= chunkLen) {
-            if (isCancelled) throw new Error('CANCELLED');
-            yield { data: audioOrDesc.slice(startSample, endSample), startSec: seg.start, endSec: seg.end, leadSec: 0 };
-          } else {
-            // 語音段太長，再切分：只有「接續視窗」開頭與前一視窗重疊（leadSec = strideSec）；每個語音段的第一個視窗是獨立起點
-            let offset = startSample;
-            while (offset < endSample) {
-              if (isCancelled) throw new Error('CANCELLED');
-              const end = Math.min(offset + chunkLen, endSample);
-              yield { data: audioOrDesc.slice(offset, end), startSec: offset / sampleRate, endSec: end / sampleRate, leadSec: offset === startSample ? 0 : strideSec };
-              if (end >= endSample) break;
-              offset += chunkLen - strideLen;
-            }
-          }
-        }
-        return;
-      }
-    }
-
-    // ── 原始全段切片路徑（VAD 關閉或無語音 fallback）───────────
-    let offset = 0;
-    while (offset < audioOrDesc.length) {
-      if (isCancelled) throw new Error('CANCELLED');
-      const end = Math.min(offset + chunkLen, audioOrDesc.length);
-      yield { data: audioOrDesc.slice(offset, end), startSec: offset / sampleRate, endSec: end / sampleRate, leadSec: offset === 0 ? 0 : strideSec };
-      if (end >= audioOrDesc.length) break;
-      offset += chunkLen - strideLen;
-    }
-    return;
+/** 依 UI 設定對記憶體中的音訊跑 VAD，回傳語音段 [{start,end}]（秒）或 null（未開啟／沒偵測到）。 */
+async function runVadForPlan(samples, sampleRate = SR) {
+  const uiThreshold = parseFloat(document.getElementById('p_vad_threshold')?.value);
+  const sileroThreshold = uiThreshold >= 0.1 && uiThreshold <= 0.9 ? uiThreshold : SILERO_VAD_THRESHOLD;
+  const speechSegs = await runVAD(samples, sampleRate, sileroThreshold);
+  if (!speechSegs || speechSegs.length === 0) {
+    log('⚠ VAD：未偵測到語音段落，降級為全段處理', 'warn');
+    return null;
   }
+  const speechDur = speechSegs.reduce((acc, s) => acc + (s.end - s.start), 0);
+  const totalDur  = samples.length / sampleRate;
+  log(`✓ VAD：偵測到 ${speechSegs.length} 個語音段（${speechDur.toFixed(1)}s / ${totalDur.toFixed(1)}s = ${Math.round(speechDur/totalDur*100)}%）`, 'ok');
+  return speechSegs;
+}
 
-  const { cacheKey, totalSamples } = audioOrDesc;
-  let globalOffset = 0;
-  let shardIdx = 0;
-  let shardBuf = null;
+/** r10b：先規劃好所有辨識視窗（VAD 開啟時把相鄰語音段打包成 ≤30 秒），回傳 { windows, totalSec, usedVad }。
+ *  大檔（IndexedDB）路徑使用 decodeAudio 存檔前就算好的 speechSegs（r10b c2；原本大檔完全沒跑 VAD）。 */
+async function prepareChunkPlan(audioOrDesc, sampleRate = SR, chunkSec = 30, strideSec = 5) {
+  const isMem = audioOrDesc instanceof Float32Array;
+  const totalSamples = isMem ? audioOrDesc.length : audioOrDesc.totalSamples;
+  const totalSec = totalSamples / sampleRate;
+  let segs = null;
+  if (document.getElementById('tog_vad')?.checked) {
+    if (isMem) segs = await runVadForPlan(audioOrDesc, sampleRate);
+    else if (Array.isArray(audioOrDesc.speechSegs) && audioOrDesc.speechSegs.length) segs = audioOrDesc.speechSegs;
+  }
+  const windows = planChunkWindows(totalSec, segs, chunkSec, strideSec);
+  if (segs) {
+    // 對照：舊做法每個語音段各自成一段（長段再切）
+    let oldCount = 0;
+    for (const sg of segs) { const d = sg.end - sg.start; oldCount += d <= chunkSec ? 1 : Math.ceil((d - strideSec) / (chunkSec - strideSec)); }
+    const speechSec = windows.reduce((a, w) => a + (w.endSec - w.startSec), 0);
+    log(`✓ 相鄰的語音合併處理：共 ${windows.length} 段要辨識（不合併要 ${oldCount} 段），跳過約 ${Math.max(0, Math.round(totalSec - speechSec))} 秒的靜音`, 'ok');
+  }
+  return { windows, totalSec, usedVad: !!segs };
+}
 
+/** 從 IndexedDB 分片讀出 [startSample, endSample)；分片讀不到回傳 null。st 為跨呼叫共用的分片快取 { idx, buf }。 */
+async function readIdbRange(cacheKey, startSample, endSample, st) {
+  const chunk = new Float32Array(Math.max(0, endSample - startSample));
+  let written = 0, pos = startSample;
+  while (written < chunk.length) {
+    const si = Math.floor(pos / SHARD_SAMPLES);
+    if (!st.buf || st.idx !== si) { st.buf = await readAudioShard(cacheKey, si); st.idx = si; }
+    if (!st.buf) { console.warn(`IDB 分片讀取失敗：cacheKey=${cacheKey}, shardIdx=${si}`); return null; }
+    const shardPos  = pos - si * SHARD_SAMPLES;
+    const toCopy    = Math.min(st.buf.length - shardPos, chunk.length - written);
+    if (toCopy <= 0) { console.warn(`IDB 分片長度不足：cacheKey=${cacheKey}, shardIdx=${si}`); return null; }
+    chunk.set(st.buf.subarray(shardPos, shardPos + toCopy), written);
+    written += toCopy; pos += toCopy;
+  }
+  return chunk;
+}
+
+async function* audioChunkGenerator(audioOrDesc, sampleRate = SR, chunkSec = 30, strideSec = 5, windows = null) {
+  const isMem = audioOrDesc instanceof Float32Array;
+  const totalSamples = isMem ? audioOrDesc.length : audioOrDesc.totalSamples;
+  const cacheKey = isMem ? null : audioOrDesc.cacheKey;
+  const st = { idx: -1, buf: null };
   try {
-    while (globalOffset < totalSamples) {
+    if (!windows) windows = (await prepareChunkPlan(audioOrDesc, sampleRate, chunkSec, strideSec)).windows;
+    for (const w of windows) {
       if (isCancelled) throw new Error('CANCELLED');
-      const endGlobal = Math.min(globalOffset + chunkLen, totalSamples);
-      const chunk = new Float32Array(endGlobal - globalOffset);
-      let written = 0;
-
-      let pos = globalOffset;
-      let shardReadFailed = false;
-      while (written < chunk.length) {
-        const si = Math.floor(pos / SHARD_SAMPLES);
-        if (!shardBuf || shardIdx !== si) {
-          shardBuf = await readAudioShard(cacheKey, si);
-          shardIdx = si;
-        }
-        if (!shardBuf) {
-          console.warn(`IDB 分片讀取失敗：cacheKey=${cacheKey}, shardIdx=${si}`);
-          shardReadFailed = true;
-          break;
-        }
-        const shardPos  = pos - si * SHARD_SAMPLES;
-        const available = shardBuf.length - shardPos;
-        const needed    = chunk.length - written;
-        const toCopy    = Math.min(available, needed);
-        chunk.set(shardBuf.subarray(shardPos, shardPos + toCopy), written);
-        written += toCopy;
-        pos     += toCopy;
-      }
-
+      const s = Math.max(0, Math.floor(w.startSec * sampleRate));
+      const e = Math.min(totalSamples, Math.ceil(w.endSec * sampleRate));
+      if (e <= s) continue;
+      const meta = { startSec: s / sampleRate, endSec: e / sampleRate, leadSec: w.leadSec || 0 };
+      if (isMem) { yield { data: audioOrDesc.slice(s, e), ...meta }; continue; }
       // 分片讀不到（例如另一個分頁開啟本程式時清空了整個 shards 暫存）：不可悄悄丟掉這段音訊。
       // 以 readError 標記交給 runInference，與「辨識失敗」走同一條跳過／連續失敗計數路徑（日誌可見、skippedCount 會顯示）。
-      const lead = globalOffset === 0 ? 0 : strideSec;
-      yield shardReadFailed
-        ? { data: null, readError: true, startSec: globalOffset / sampleRate, endSec: endGlobal / sampleRate, leadSec: lead }
-        : { data: chunk, startSec: globalOffset / sampleRate, endSec: endGlobal / sampleRate, leadSec: lead };
-      if (endGlobal >= totalSamples) break;
-      // 【Bug 1 修復】：套用 stride overlap，與 Float32Array 路徑邏輯一致
-      globalOffset += chunkLen - strideLen;
+      const data = await readIdbRange(cacheKey, s, e, st);
+      yield data ? { data, ...meta } : { data: null, readError: true, ...meta };
     }
   } finally {
-    await idbDeletePrefix(cacheKey);
-    activeIdbCacheKey = null;
-    log('✓ IDB 暫存已清除', 'ok');
+    if (!isMem) {
+      await idbDeletePrefix(cacheKey);
+      activeIdbCacheKey = null;
+      log('✓ IDB 暫存已清除', 'ok');
+    }
   }
 }
 
@@ -5283,6 +5569,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     model: selectedModel,
     startedAt: Date.now(),
     lastChunkIdx: resumeFromChunk,
+    resumeSec: Number.isFinite(opts.resumeSec) ? opts.resumeSec : null,
     chunks: resumeChunks,
   });
 
@@ -5373,24 +5660,43 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     const STRIDE_SEC = 5;
     const totalSamples = audio instanceof Float32Array ? audio.length : audio.totalSamples;
     const totalAudSec  = totalSamples / SR;
+    // r10b b3（選項）：一般模式用短提示詞（約 80 個單位，保留最後面＝你的提示詞＋繁中引導句＋最重要的免疫微生物名詞）
+    const promptMaxTokens = (promptText && document.getElementById('tog_short_prompt')?.checked && _lastBackend !== 'webgpu') ? PROMPT_SHORT_TOKENS : PROMPT_MAX_TOKENS;
+    if (promptText && promptMaxTokens !== PROMPT_MAX_TOKENS) log(`💬 一般模式使用短提示詞（最多 ${promptMaxTokens} 個單位，速度較快）`, 'info');
+
+    // r10b：先規劃好所有辨識視窗（含 VAD 打包），才能準確算剩餘時間
+    const plan = await prepareChunkPlan(audio, SR, CHUNK_SEC, STRIDE_SEC);
+    const windows = plan.windows;
+    const totalWorkSec = windows.reduce((a, w) => a + (w.endSec - w.startSec), 0);
+    const segTimes = [];       // r10b f：每段 { audioSec, ms }，算移動平均的剩餘時間
+    const reviewMarks = [];    // r10b：鬼打牆重試後仍可疑的段落 { startSec, endSec, reason }（只在網頁預覽標出，不寫進字幕）
+    let loopSegs = 0;
+    let _etaAnnounced = false;
 
     _inferStart  = Date.now();
 
-    // 斷點續傳：從上次位置繼續
+    // 斷點續傳：從上次位置繼續。r10b：新版用「已完成到第幾秒」(resumeSec) 對齊，不受視窗規劃改變影響；舊紀錄才用段數
     const allChunks = resumeChunks.slice();
-    let i = resumeFromChunk;
-    if (resumeFromChunk > 0) log(`▸ 從第 ${resumeFromChunk + 1} 段繼續恢復辨識`, 'ok');
+    const resumeSec = Number.isFinite(opts.resumeSec) ? opts.resumeSec : null;
+    let skipCount = 0;
+    if (resumeSec != null) {
+      while (skipCount < windows.length) {
+        const w = windows[skipCount];
+        if (w.startSec + (w.leadSec || 0) / 2 < resumeSec - 0.01) skipCount++; else break;
+      }
+    } else skipCount = Math.min(resumeFromChunk, windows.length);
+    let i = skipCount;
+    if (i > 0) log(`▸ 從第 ${i + 1} 段繼續恢復辨識`, 'ok');
 
-    const gen = audioChunkGenerator(audio, SR, CHUNK_SEC, STRIDE_SEC);
+    const gen = audioChunkGenerator(audio, SR, CHUNK_SEC, STRIDE_SEC, windows);
     const skipped = [];     // 最終辨識失敗而跳過的段落 { idx（0 起算）, startSec }
     let failStreak = 0;     // 連續失敗的段落數
+    let doneSec = resumeSec != null ? resumeSec : 0;   // 已定稿到第幾秒（斷點續傳用）
 
-    // 跳過已完成的 chunk（若斷點續傳）
-    let skipCount = resumeFromChunk;
     let nextSegPromise = gen.next();
 
     const _resumeStartedAt = Date.now();
-    let _resumeSavedIdx = resumeFromChunk;
+    let _resumeSavedIdx = i;
     const saveResumePoint = () => {
       _resumeSavedIdx = i;
       return taskStatePut(taskKey, {
@@ -5399,6 +5705,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         model: selectedModel,
         startedAt: _resumeStartedAt,
         lastChunkIdx: i,
+        resumeSec: doneSec,
         chunks: allChunks.slice(),
       }).catch(() => {});
     };
@@ -5416,11 +5723,11 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
 
       const processedSec = seg.startSec;
       const pct = 60 + Math.min((processedSec / totalAudSec) * 35, 35);
-      const elapsed = (Date.now() - _inferStart) / 1000;
       setProgress(pct, `辨識中... ${seg.startSec.toFixed(0)}s / ${totalAudSec.toFixed(0)}s`);
-      if (elapsed > 2) updateEta(Math.max(processedSec, 0.1), totalAudSec);
+      const remainWork = windows.slice(i).reduce((a, w) => a + (w.endSec - w.startSec), 0);
+      updateEta(estimateRemaining(segTimes, remainWork));
 
-      const base = { language, task, promptText, segIdx: i, startSec: seg.startSec };
+      const base = { language, task, promptText, promptMaxTokens, segIdx: i, startSec: seg.startSec };
       // seg.data 永不被 transfer（每次嘗試傳複本），所以重試不需要另存 retry buffer
       let res = seg.readError
         ? { ok: false, kind: 'io', error: '音訊分片讀取失敗（IndexedDB 暫存可能已被其他分頁清除）' }
@@ -5466,7 +5773,11 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       // 開頭與前一視窗重疊的秒數內的字已由前一視窗輸出，這裡丟棄以免重複。
       // 只有「接續視窗」才有重疊（leadSec）；VAD 的每個語音段第一個視窗是獨立起點，不可丟（原本用 i === 0 判斷，
       // VAD 開啟時每段（第一段除外）都被吃掉前 5 秒，短於 5 秒的語音段整段消失）。
-      const cleanStart = seg.leadSec ?? 0;
+      // r10b b6：不再跑 seek 補算後，視窗尾端可能是半句話 → 前後兩個視窗都在「重疊區中點」切開：
+      // 這個視窗丟掉中點之前的字（接續視窗）、也丟掉下一個接續視窗中點之後的字（交給下一個視窗）。
+      const cleanStart = (seg.leadSec ?? 0) / 2;
+      const nxt = (await nextSegPromise).value;
+      const nextCut = (nxt && nxt.leadSec > 0 && nxt.startSec < seg.endSec) ? (nxt.startSec + nxt.leadSec / 2) - chunkStart : Infinity;
 
       let mergedText = '', mergedStart = null, mergedEnd = null;
       for (let wi = 0; wi < segChunks.length; wi++) {
@@ -5474,6 +5785,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         if (!c.timestamp) continue;
         const [ws, we] = c.timestamp;
         if (ws != null && ws < cleanStart) continue;
+        if (ws != null && ws >= nextCut) continue;
         const absStart = ws != null ? ws + chunkStart : null;
         const absEnd   = we != null ? we + chunkStart : null;
 
@@ -5500,6 +5812,27 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       }
 
       i++;
+      doneSec = Number.isFinite(nextCut) ? chunkStart + nextCut : seg.endSec;
+
+      // r10b：量測日誌（每段耗時／編碼器次數／新字詞數）＋剩餘時間
+      const st = evt.payload.stats;
+      if (st && st.ms > 0) {
+        segTimes.push({ audioSec: st.audioSec || (seg.endSec - seg.startSec), ms: st.ms });
+        log(formatSegStats(i, st), st.loop ? 'warn' : 'info');
+        if (st.loop) loopSegs++;
+        if (st.flagged) {
+          const from = chunkStart + Math.max(cleanStart, Math.min(st.keptEnd || 0, seg.endSec - chunkStart));
+          reviewMarks.push({ startSec: Math.max(seg.startSec, from - 2), endSec: seg.endSec,
+            reason: st.loop === 'budget' ? '這段字幕異常地多（可能一直重複），已自動截掉，可能漏字' : '這段一直重複同一個詞，已自動截掉，可能漏字' });
+        }
+        const remain = windows.slice(i).reduce((a, w) => a + (w.endSec - w.startSec), 0);
+        const est = estimateRemaining(segTimes, remain);
+        updateEta(est);
+        if (!_etaAnnounced && est && segTimes.length >= 2 && remain > 60) {
+          _etaAnnounced = true;
+          log(`⏱ 依目前速度，這個檔案還要${plainDuration(est.remainSec)}（每 1 分鐘的音訊約需 ${Math.max(1, Math.round(est.secPerAudioSec * 60))} 秒）。接上電源、關掉其他程式會比較快。`, 'ok');
+        }
+      }
 
       // ── 斷點續傳：每 RESUME_SAVE_EVERY 段寫一次（r9：原本每段都把整份 allChunks 寫進 IndexedDB，長堂課越寫越大）。
       // 中途停止／出錯時下面的 catch 會補寫最後進度，所以不會因為間隔而少存。
@@ -5515,6 +5848,8 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       const list = skipped.map((k) => `第 ${k.idx + 1} 段（${fmtTime(k.startSec).slice(0, 8)} 起）`).join('、');
       log(`⚠ ${skipped.length} 段辨識失敗已跳過：${list}`, 'warn');
     }
+    if (reviewMarks.length > 0) showUvrNotice(`有 ${reviewMarks.length} 段可能漏字（一直重複同一個詞，已自動截掉），已在下方預覽標出，可點選重聽確認。`, file && file.name);
+    if (loopSegs > 0) log(`⏲ 量測合計：${segTimes.length} 段，其中 ${loopSegs} 段出現重複迴圈（${reviewMarks.length} 段標記待確認）`, 'info');
     // r9 覆核 N12：照抄提示詞被移除時，完成畫面也要說（不只寫在日誌），老師可回頭核對
     if (_promptLeak.segs > 0) {
       showUvrNotice(`有 ${_promptLeak.segs} 處是模型把提示詞原文照抄進字幕，已自動刪除（共 ${_promptLeak.words} 個字詞）。想核對的話，下方紀錄有寫是第幾段、從幾分幾秒開始。`, file && file.name);
@@ -5591,7 +5926,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       }
     }
 
-    return { success: true, chunks, outputContent, baseName, ext: ext2, skippedCount: skipped.length, vocalBlob: vocal?.wavBlob ?? null };
+    return { success: true, chunks, outputContent, baseName, ext: ext2, skippedCount: skipped.length, vocalBlob: vocal?.wavBlob ?? null, reviewMarks };
 
   } catch(e) {
     if (e.message === 'CANCELLED') {
@@ -5726,18 +6061,20 @@ startBtn.addEventListener('click', async () => {
     // 斷點續傳：檢查是否有此檔案的恢復資訊
     let resumeFrom = 0;
     let resumeChunks = [];
+    let resumeSec = null;
     if (window._resumeTask &&
         window._resumeTask.fileName === item.file.name &&
         window._resumeTask.fileSize === item.file.size &&
         window._resumeTask.fileLastModified === item.file.lastModified) {
       resumeFrom   = window._resumeTask.lastChunkIdx || 0;
       resumeChunks = window._resumeTask.chunks || [];
+      resumeSec    = Number.isFinite(window._resumeTask.resumeSec) ? window._resumeTask.resumeSec : null;
       window._resumeTask = null;
       document.getElementById('resumeBanner')?.classList.remove('show');
       log(`▸ 斷點續傳：從第 ${resumeFrom + 1} 段恢復（已有 ${resumeChunks.length} 個結果）`, 'ok');
     }
 
-    const result = await runInference(item.file, resumeFrom, resumeChunks, { wantVocalWav: pendingItems.length === 1 });
+    const result = await runInference(item.file, resumeFrom, resumeChunks, { wantVocalWav: pendingItems.length === 1, resumeSec });
 
     if (result.cancelled) {
       setBatchItemStatus(item.id, 'cancelled');
@@ -5751,7 +6088,7 @@ startBtn.addEventListener('click', async () => {
       // 須在 setBatchItemStatus() 觸發的重繪之前完成賦值，否則該次重繪會缺少 chunks 而不顯示預覽按鈕
       {
         const qItemForPreview = batchQueue.find(qi => qi.id === item.id);
-        if (qItemForPreview) { qItemForPreview.chunks = result.chunks; qItemForPreview.skippedCount = result.skippedCount ?? 0; }
+        if (qItemForPreview) { qItemForPreview.chunks = result.chunks; qItemForPreview.skippedCount = result.skippedCount ?? 0; qItemForPreview.reviewMarks = result.reviewMarks ?? []; }
       }
       setBatchItemStatus(item.id, 'done');
       doneCount++;
