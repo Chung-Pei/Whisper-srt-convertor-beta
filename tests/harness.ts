@@ -92,6 +92,7 @@ export async function buildSegments(ctx: BrowserContext, spec: CorpusSpec): Prom
 export type Rule = { segIdx: number; attempt?: number; silent?: boolean; crash?: string;
   pre?: any[];   // r9：CHUNK_DONE 之前先送出的訊息（例如 PROMPT_LEAK_REMOVED）
   stats?: any;   // r10b：CHUNK_DONE 夾帶的量測（鬼打牆、耗時等）
+  delay?: number;   // r10c：這段回覆前等多久（毫秒，預設 3）
   reply?: { type: 'CHUNK_ERROR'; error: string } | { type: 'ERROR'; payload: string } };
 
 export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; gapSegments?: Record<number, any>; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
@@ -142,7 +143,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
             if (rule?.reply?.type === 'CHUNK_ERROR') this.emit({ type: 'CHUNK_ERROR', payload: { error: rule.reply.error, segIdx: p.segIdx } });
             else if (rule?.reply?.type === 'ERROR') this.emit({ type: 'ERROR', payload: rule.reply.payload });
             else this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: segments[p.segIdx % segments.length] }, segIdx: p.segIdx, startSec: p.startSec, strideSec: p.strideSec, stats: rule?.stats } });
-          }, 3);
+          }, rule?.delay ?? 3);
         }
       }
       terminate() { this.dead = true; }

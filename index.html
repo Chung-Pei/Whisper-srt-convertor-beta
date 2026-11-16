@@ -810,12 +810,13 @@
 
   .btn-cancel {
     width: 100%;
+    min-height: 44px;
     padding: 0.75rem;
     background: transparent;
     border: 1.5px solid var(--err);
     border-radius: var(--radius);
     color: var(--err);
-    font-size: 0.85rem;
+    font-size: 0.9rem;
     font-weight: 700;
     font-family: 'Syne', system-ui, sans-serif;
     cursor: pointer;
@@ -827,6 +828,18 @@
     margin-bottom: 1rem;
   }
   .btn-cancel.show { display: flex; }
+  /* r10c：暫停／繼續（與紅色「取消」區分：藍色實心、較大字） */
+  .btn-pause {
+    width: 100%; min-height: 44px; padding: 0.7rem;
+    background: transparent; border: 1.5px solid var(--accent); border-radius: var(--radius);
+    color: var(--accent); font-size: 0.95rem; font-weight: 700; font-family: 'Syne', system-ui, sans-serif;
+    cursor: pointer; display: none; align-items: center; justify-content: center; gap: 8px; margin-bottom: 0.6rem;
+  }
+  .btn-pause.show { display: flex; }
+  .btn-pause.paused { background: var(--accent); color: var(--bg); }
+  .btn-pause:disabled { opacity: 0.6; cursor: default; }
+  .pause-note { display: none; font-size: 0.9rem; line-height: 1.5; margin: -0.2rem 0 0.8rem; color: var(--text, inherit); }
+  .pause-note.show { display: block; }
   .btn-cancel:hover { background: rgba(255,90,90,0.08); }
 
   .batch-queue {
@@ -1759,6 +1772,8 @@
     <span id="btnTxt">▶ 開始辨識</span>
   </button>
 
+  <button class="btn-pause" id="pauseBtn" type="button">⏸ 暫停</button>
+  <div class="pause-note" id="pauseNote" role="status" aria-live="polite"></div>
   <button class="btn-cancel" id="cancelBtn">✕ 取消辨識</button>
 
   <div class="batch-summary" id="batchSummary">
@@ -5931,6 +5946,8 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     try {
     while (true) {
       if (isCancelled) throw new Error('CANCELLED');
+      await maybePauseHere(saveResumePoint);   // r10c：安全點（上一段已定稿、doneSec／pending 一致）
+      if (isCancelled) throw new Error('CANCELLED');
 
       const { value: seg, done } = await nextSegPromise;
       if (done) break;
@@ -6242,8 +6259,56 @@ function fireCancelRejects() {
   }
 }
 
+// ── r10c：暫停／繼續 ──────────────────────────────────────────
+// 按「暫停」→ 等目前這一段辨識完（安全點：辨識迴圈開頭），寫入斷點後停住；模型留在記憶體，按「繼續」直接接著跑。
+// 暫停中關掉網頁也沒關係：斷點已存，下次開網頁按「恢復任務」接續。
+let pauseRequested = false;
+let _pauseResolve = null;   // 暫停中＝非 null；呼叫它就繼續
+const pauseBtn  = document.getElementById('pauseBtn');
+const pauseNote = document.getElementById('pauseNote');
+function setPauseUi(state) {   // 'run' | 'pending' | 'paused' | 'hide'
+  if (!pauseBtn) return;
+  pauseBtn.classList.toggle('show', state !== 'hide');
+  pauseBtn.classList.toggle('paused', state === 'paused');
+  pauseBtn.disabled = false;
+  pauseNote.classList.toggle('show', state === 'pending' || state === 'paused');
+  if (state === 'run' || state === 'hide') { pauseBtn.textContent = '⏸ 暫停'; pauseNote.textContent = ''; }
+  else if (state === 'pending') {
+    pauseBtn.textContent = '⏳ 這一段辨識完就暫停（再按一下＝不暫停）';
+    pauseNote.textContent = '正在辨識的這一小段做完就會停下，大約幾十秒內。';
+  } else if (state === 'paused') {
+    pauseBtn.textContent = '▶ 繼續辨識';
+    pauseNote.textContent = '已暫停，進度已存好。按「繼續辨識」接著做；也可以先關掉網頁，下次開啟時按「恢復任務」接續。';
+  }
+}
+/** 辨識迴圈在每段開始前呼叫：有人按了暫停就存斷點、停住，直到按「繼續」或「取消」。 */
+async function maybePauseHere(saveFn) {
+  if (!pauseRequested || isCancelled) return;
+  pauseRequested = false;
+  try { await saveFn(); } catch (_) {}
+  setPauseUi('paused');
+  setProgress(parseFloat(progPct.textContent) || 0, '已暫停', false);
+  log('⏸ 已暫停（進度已存好）', 'ok');
+  if (typeof resetEta === 'function') resetEta();
+  await releaseWakeLock();
+  await new Promise((resolve) => { _pauseResolve = resolve; });
+  _pauseResolve = null;
+  if (isCancelled) return;
+  await acquireWakeLock();
+  setPauseUi('run');
+  log('▶ 繼續辨識', 'ok');
+}
+pauseBtn?.addEventListener('click', () => {
+  if (_pauseResolve) { _pauseResolve(); return; }            // 暫停中 → 繼續
+  pauseRequested = !pauseRequested;                           // 等待暫停中再按一次＝不暫停
+  setPauseUi(pauseRequested ? 'pending' : 'run');
+});
+
 cancelBtn.addEventListener('click', () => {
   isCancelled = true;
+  pauseRequested = false;
+  if (_pauseResolve) _pauseResolve();
+  setPauseUi('hide');
   cancelBtn.textContent = '⏳ 取消中...';
   cancelBtn.disabled = true;
   log('⚠ 正在取消辨識...', 'warn');
@@ -6278,6 +6343,8 @@ startBtn.addEventListener('click', async () => {
   cancelBtn.classList.add('show');
   cancelBtn.textContent = '✕ 取消辨識';
   cancelBtn.disabled = false;
+  pauseRequested = false;
+  setPauseUi('run');
   batchSummaryEl.classList.remove('show');
 
   document.getElementById('spinner').classList.add('show');
@@ -6441,6 +6508,8 @@ startBtn.addEventListener('click', async () => {
     fileInput.disabled = false;
     dropZone.classList.remove('disabled');
     cancelBtn.classList.remove('show');
+    pauseRequested = false;
+    setPauseUi('hide');
     document.getElementById('spinner').classList.remove('show');
     document.getElementById('btnTxt').textContent = '▶ 開始辨識';
     setProgress(isCancelled ? 0 : 100, isCancelled ? '已取消' : '完成！', false);
