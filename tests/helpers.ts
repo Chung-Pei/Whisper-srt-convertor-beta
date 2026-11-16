@@ -25,7 +25,7 @@ export async function installFakeWhisperWorker(page: Page, chunks: { text: strin
           if (msg.type === 'LOAD_MODEL') this.emit({ type: 'MODEL_READY', payload: { device: 'wasm' } });
           else if (msg.type === 'RUN_CHUNK') {
             const p = msg.payload;
-            this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: chunkList }, segIdx: p.segIdx, startSec: p.startSec, strideSec: p.strideSec } });
+            this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: p.gapFill ? [] : chunkList }, segIdx: p.segIdx, startSec: p.startSec, strideSec: p.strideSec } });
           }
         }, 3);
       }

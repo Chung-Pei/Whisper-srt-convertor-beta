@@ -359,7 +359,7 @@ async function installFakes(page: Page) {
               type: 'CHUNK_DONE',
               payload: {
                 result: {
-                  chunks: [
+                  chunks: p.gapFill ? [] : [
                     { text: '測試', timestamp: [0.2, 0.6] },
                     { text: '字幕', timestamp: [0.7, 1.1] },
                     { text: '第一句', timestamp: [1.2, 1.8] },

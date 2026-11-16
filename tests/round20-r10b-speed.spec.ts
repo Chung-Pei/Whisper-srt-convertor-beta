@@ -8,11 +8,13 @@
 //   S-07  覆核 r1 M1：接縫文字對齊（stitchSeam）／逐字成句；M3 續傳秒數（resumeSecOf）
 //   S-08  覆核 r1 M3／S6：舊格式續傳紀錄（只有段數）→ 以秒對齊、跨過的視窗照跑、待確認清單保留
 //   S-09  覆核 r1 S9c：同一個打包視窗裡的多個語音段，每段段首字都在
+//   S-10  覆核 r2 N1／N3／S-a／S-b：接縫共同片段要時間相符；老師的「對、對、對」不判成鬼打牆；長句迴圈；接縫空白判斷
+//   S-11  覆核 r2 N2：接縫兩窗都沒輸出的空白 → 補聽一次補回；補聽失敗 → 待確認清單
 import { test, expect, type Page } from '@playwright/test';
 import { newCtx, openWithHook, installScriptedWorker, BASE_URL, type Seg } from './harness';
 import { setToggles, downloadText } from './helpers';
 
-const NAMES = ['WORKER_CODE', 'spawnWorker', 'detectTokenLoop', 'trimRepeatTail', 'planChunkWindows', 'estimateRemaining', 'plainDuration', 'WHISPER_MAX_TARGET', 'stitchSeam', 'wordsToLines', 'resumeSecOf', 'clockText'];
+const NAMES = ['WORKER_CODE', 'spawnWorker', 'detectTokenLoop', 'trimRepeatTail', 'planChunkWindows', 'estimateRemaining', 'plainDuration', 'WHISPER_MAX_TARGET', 'stitchSeam', 'wordsToLines', 'resumeSecOf', 'clockText', 'tailLoopLike', 'seamGapRange', 'mostlyVoiced'];
 
 async function runInWorker(page: Page, body: string) {
   return page.evaluate(async (body) => {
@@ -181,6 +183,11 @@ test.describe('r10b Worker', () => {
       const longLoop = { tokens: [].concat.apply([], Array(20).fill(longUnit)), chunks: [W('今天', 0)].concat([].concat.apply([], Array(5).fill(0).map(function (_, r) { return [W('細胞', 2 + r * 2), W('激素', 2.5 + r * 2), W('受體', 3 + r * 2), W('，', 3.4 + r * 2)]; }))) };
       calls.length = 0; out.length = 0; script = function (c) { return c.prompt ? longLoop : full; }; await run('長提示', 60);
       res.longLoop = { calls: calls.slice(), stats: out.filter(function (m) { return m.type === 'CHUNK_DONE'; })[0].payload.stats, extend: out.filter(function (m) { return m.type === 'CHUNK_EXTEND'; }).length };
+      // 7b) 覆核 r2 S-a：比停止條件看得到的還長（60 個單位）的整句迴圈 → 用完空間 → 文字尾端整句重複 ≥3 次 → 當鬼打牆
+      const u60 = Array(60).fill(0).map(function (_, i) { return 3000 + i; });
+      const longLoop2 = { tokens: [].concat.apply([], Array(8).fill(u60)), chunks: [W('今天', 0)].concat([].concat.apply([], Array(5).fill(0).map(function (_, r) { return [W('細胞', 2 + r * 3), W('激素', 2.4 + r * 3), W('受體', 2.8 + r * 3), W('會', 3.2 + r * 3), W('活化', 3.5 + r * 3), W('，', 3.9 + r * 3)]; }))) };
+      calls.length = 0; out.length = 0; script = function (c) { return c.prompt ? longLoop2 : full; }; await run('長提示', 60);
+      res.longLoop2 = { calls: calls.slice(), stats: out.filter(function (m) { return m.type === 'CHUNK_DONE'; })[0].payload.stats };
       // 8) 覆核 r1 S3：迴圈在段尾（後面不到 1 秒）→ 只截掉、不標記
       const endLoop = { tokens: [100].concat(Array(20).fill(0).map(function (_, i) { return i % 2 ? 801 : 800; })), chunks: [W('今天', 0)].concat(Array(10).fill(0).map(function (_, i) { return W(i % 2 ? '，' : '射音', 28.5 + i * 0.1); })) };
       calls.length = 0; out.length = 0; script = function () { return endLoop; }; await run(null);
@@ -219,7 +226,9 @@ test.describe('r10b Worker', () => {
     expect(o.noPrompt.stats).toMatchObject({ loop: 'repeat2', retried: false, flagged: true });
     expect(o.tsLoop.stats).toMatchObject({ loop: 'repeat3', mode: 'fast', retried: true, retryOk: true });
     expect(o.tsLoop.calls.length).toBe(2); expect(o.tsLoop.calls[1].prompt).toBe(false);
-    expect(o.longLoop.stats).toMatchObject({ loop: 'repeatText', mode: 'fast', retried: true, retryOk: true });
+    expect(o.longLoop.stats).toMatchObject({ loop: 'repeat25', mode: 'fast', retried: true, retryOk: true });   // 覆核 r2 S-a：停止條件已能抓 25 個單位的整句
+    expect(o.longLoop2.stats).toMatchObject({ loop: 'repeatText', mode: 'fast', retried: true, retryOk: true });
+    expect(o.longLoop2.calls.every((c: any) => c.max_new_tokens)).toBe(true);
     expect(o.longLoop.calls.every((c: any) => c.max_new_tokens)).toBe(true);   // 沒有改跑完整模式
     expect(o.longLoop.extend).toBe(1);   // 重試前通知主執行緒重設逾時（S13）
     expect(o.endLoop.stats).toMatchObject({ loop: 'repeat2', flagged: false }); expect(o.endLoop.stats.lostSec).toBeLessThan(1);
@@ -260,7 +269,7 @@ test.describe('r10b 主程式與畫面', () => {
     expect(txt).not.toContain('⚠');
     const log = await page.locator('#logBox').innerText();
     expect(log).toContain('⏲ 段落 1：30.0 秒音訊花 6.0 秒（模型讀音訊 1 次、產生 118 個字詞單位）');
-    expect(log).toContain('這段一直重複同一個詞，已提早停止、截掉 12 個重複字詞；不帶提示詞重試一次：仍不理想，保留截短後的版本；已標記待確認（後面約 19.5 秒可能漏字）');
+    expect(log).toContain('這段一直重複同一句話或同一個詞，已提早停止、截掉 12 個重複字詞；不帶提示詞重試一次：仍不理想，保留截短後的版本；已標記待確認（後面約 19.5 秒可能漏字）');
     expect(log).toContain('其中 1 段出現重複迴圈（1 段標記待確認）');
     expect(log).not.toMatch(/token|n-gram/i);
     await expect(page.locator('#uvrNotice')).toContainText('有 1 段可能漏字');
@@ -409,5 +418,117 @@ test.describe('r10b 第 1 輪覆核修正', () => {
     const txt = await downloadText(page);
     for (const k of ['P1頭', 'P2頭', 'P3頭', 'P4頭']) expect(txt, `缺少 ${k}`).toContain(k);
     await ctx.close();
+  });
+});
+
+test.describe('r10b 第 2 輪覆核修正', () => {
+  test('S-10 接縫共同片段要時間相符（N1）；判定用保守門檻（N3）；長句迴圈（S-a）；接縫空白（N2）', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const r = await page.evaluate(() => {
+      const T = (window as any).__t; const S = T.stitchSeam;
+      const w = (text: string, s: number, e?: number) => ({ text, s, e: e ?? s + 0.3 });
+      const join = (A: any[], B: any[], ovEnd: number) => { const m = S(A, B, ovEnd); return { how: m.how, text: A.slice(0, m.keepPrev).concat(B.slice(m.nextFrom)).map((x: any) => x.text).join('') }; };
+      const ch = (arr: string[]) => arr.map((t) => ({ text: t, timestamp: [0, 1] }));
+      const rep = (u: string[], n: number, head: string[] = ['今天', '講']) => ch(head.concat(...Array(n).fill(u)));
+      const sent = '這個抗原呈現細胞會把抗原片段放到MHC分子上給T細胞看'.split('');
+      return {
+        // 覆核 r2 N1 實例 1：IgG 在兩窗不同時間（25.0 vs 28.0 秒）→ 不可在 IgG 接起來吞掉「跟IgM都是抗體其中」
+        igg: join([w('I', 25.0), w('gG', 25.2), w('跟', 25.5), w('I', 25.7), w('gM', 25.9), w('都是', 26.1)],
+                  [w('抗體', 26.9), w('其中', 27.5), w('I', 28.0), w('gG', 28.2), w('最多', 28.5)], 30),
+        // 實例 2：「這個」在前一窗 25.0 秒、後一窗 26.8 秒 → 不可吞掉「抗體」
+        zhege: join([w('這', 25.0), w('個', 25.2), w('抗', 25.6), w('體', 26.0, 26.6)],
+                    [w('這', 26.8), w('個', 27.0), w('時候', 27.3), w('我們', 27.8), w('看', 28.2)], 30),
+        // 時間相符的共同片段仍照常接（不重複）
+        ok: join([w('抗', 25.0), w('原', 25.3), w('呈', 25.6), w('現', 25.9)], [w('抗', 25.1), w('原', 25.4), w('呈', 25.7), w('現', 26.0), w('細胞', 26.4)], 30),
+        // 只有 2 個字的片段時間差 0.8 秒（>0.5）→ 不接
+        two: join([w('我', 25.0), w('們', 25.2), w('甲', 25.5)], [w('我', 25.8), w('們', 26.0), w('乙', 26.3)], 30).how,
+        // N3：真實切法「對、」「I」「gG、」在尾端
+        dui3: T.tailLoopLike(rep(['對、'], 3, ['老師', '說'])), dui11: T.tailLoopLike(rep(['對、'], 11)), dui12: T.tailLoopLike(rep(['對、'], 12)),
+        igg3: T.tailLoopLike(rep(['I', 'gG、'], 3)), igg5: T.tailLoopLike(rep(['I', 'gG、'], 5)), igg6: T.tailLoopLike(rep(['I', 'gG、'], 6)),
+        hao3: T.tailLoopLike(ch(['好', '好', '好'])),
+        sent2: T.tailLoopLike(rep(sent, 2)), sent3: T.tailLoopLike(rep(sent, 3)),
+        // S-a：長句（30 個單位）重複 3 次停止條件抓得到
+        tok30: T.detectTokenLoop([1, 2, 3].concat(...Array(3).fill(Array.from({ length: 30 }, (_, i) => 1000 + i))), 30),
+        trim30: T.trimRepeatTail(rep(sent, 3)).removed,
+        // N2：接縫空白
+        gapA: T.seamGapRange(20.8, 27, 25, 5, 0),     // 前一窗 20.8 秒後沒字、後一窗 27 秒才有字
+        gapB: T.seamGapRange(26.5, 27.2, 25, 5, 0),   // 0.7 秒 → 不算
+        gapC: T.seamGapRange(3, 27, 25, 5, 0),        // 只看起點前 10 秒
+        gapD: T.seamGapRange(null, null, 25, 5, 0),
+        gapE: T.seamGapRange(5, 8, 25, 5, 0),         // 空白不在接縫附近
+        voiced: T.mostlyVoiced(Float32Array.from({ length: 32000 }, (_, i) => 0.2 * Math.sin(i / 10)), 16000),
+        silent: T.mostlyVoiced(new Float32Array(32000), 16000),
+      };
+    });
+    expect(r.igg.text).toContain('跟IgM都是抗體其中');
+    expect(r.zhege.text).toContain('抗體');
+    expect(r.ok).toEqual({ how: 'text', text: '抗原呈現細胞' });
+    expect(r.two).toBe('time');
+    expect([r.dui3, r.dui11, r.igg3, r.igg5, r.hao3, r.sent2]).toEqual([false, false, false, false, false, false]);
+    expect([r.dui12, r.igg6, r.sent3]).toEqual([true, true, true]);
+    expect(r.tok30).toBe('repeat30');
+    expect(r.trim30).toBe(54);   // 整句 27 個單位，重複 3 次 → 截掉後 2 次
+    expect(r.gapA).toEqual({ from: 20.8, to: 27 });
+    expect(r.gapB).toBeNull();
+    expect(r.gapC).toEqual({ from: 15, to: 27 });
+    expect(r.gapD).toBeNull(); expect(r.gapE).toBeNull();
+    expect(r.voiced).toBe(true); expect(r.silent).toBe(false);
+    await ctx.close();
+  });
+
+  test('S-04b 真實 Worker：重試結果尾端是老師的「對、對、對」→ 仍採用重試（N3）', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, NAMES, 'new');
+    const out = await runInWorker(page, `
+      const ch = (arr) => arr.map((t, i) => ({ text: t, timestamp: [i * 0.3, i * 0.3 + 0.3] }));
+      const tail = ['好', '那', '我們', '說', '對、', '對、', '對、'];
+      const r = tailLoopLike(ch(tail));
+      const r2 = tailLoopLike(ch(['甲'].concat(Array(12).fill('對、'))));
+      return { r, r2 };
+    `);
+    expect(out.type).toBe('T_OK');
+    expect(out.out).toEqual({ r: false, r2: true });
+    await ctx.close();
+  });
+
+  test('S-11 接縫兩窗都沒輸出 → 補聽一次補回；補聽失敗 → 待確認清單（N2）', async ({ browser }) => {
+    test.setTimeout(120_000);
+    for (const mode of ['fill', 'fail'] as const) {
+      const ctx = await newCtx(browser); const page = await ctx.newPage();
+      // 60 秒、不開 VAD → 視窗 [0,30] [25,55] [50,60]
+      await installScriptedWorker(page, {
+        segments: [
+          [{ text: 'A1', timestamp: [1, 2] }, { text: 'A2', timestamp: [20, 21.5] }],
+          [{ text: 'B1', timestamp: [2, 2.5] }, { text: 'B2', timestamp: [25.5, 26] }],
+          [{ text: 'C1', timestamp: [2, 3] }],
+        ],
+        gapSegments: { 1: mode === 'fill' ? [{ text: '補字', timestamp: [2, 3] }] : 'error' },
+      });
+      await page.goto(BASE_URL);
+      await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+      await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+      await page.locator('#fileInput').setInputFiles({ name: 'gap.wav', mimeType: 'audio/wav', buffer: wav(60) });
+      await page.locator('#startBtn').click();
+      await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+      const gaps = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'GAP_RUN'));
+      expect(gaps.length).toBe(1);
+      expect(gaps[0].segIdx).toBe(1);
+      expect(gaps[0].startSec).toBeCloseTo(19.8, 1);   // 空白 20.8～27 秒，前後各多聽 1 秒
+      expect(gaps[0].sec).toBeGreaterThan(7); expect(gaps[0].sec).toBeLessThan(8.5);
+      const txt = await downloadText(page);
+      const log = await page.locator('#logBox').innerText();
+      if (mode === 'fill') {
+        expect(txt.indexOf('A2')).toBeLessThan(txt.indexOf('補字'));
+        expect(txt.indexOf('補字')).toBeLessThan(txt.indexOf('B1'));
+        expect(log).toContain('補回 1 個字');
+      } else {
+        for (const k of ['A1', 'A2', 'B1', 'B2', 'C1']) expect(txt).toContain(k);
+        expect(txt).not.toContain('⚠');
+        const id = await page.locator('.batch-item.done').first().getAttribute('data-id');
+        await page.locator(`.batch-item-preview-btn[data-id="${id}"]`).click();
+        await expect(page.locator(`.item-preview-panel[data-id="${id}"] .preview-review-item`)).toHaveCount(1);
+        await expect(page.locator(`.item-preview-panel[data-id="${id}"] .preview-review-item`)).toContainText('接縫');
+      }
+      await ctx.close();
+    }
   });
 });

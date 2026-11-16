@@ -94,8 +94,8 @@ export type Rule = { segIdx: number; attempt?: number; silent?: boolean; crash?:
   stats?: any;   // r10b：CHUNK_DONE 夾帶的量測（鬼打牆、耗時等）
   reply?: { type: 'CHUNK_ERROR'; error: string } | { type: 'ERROR'; payload: string } };
 
-export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
-  await page.addInitScript(({ segments, rules, backend, loadErrors }) => {
+export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; gapSegments?: Record<number, any>; rules?: Rule[]; backend?: 'webgpu' | 'wasm'; loadErrors?: (string | null)[] }) {
+  await page.addInitScript(({ segments, gapSegments, rules, backend, loadErrors }) => {
     const w = window as any;
     w.__workerLog = []; w.__attempts = {}; w.__dtype = null; w.__nWorkers = 0;
     class FakeWorker extends EventTarget {
@@ -118,6 +118,14 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
           if (loadErrors[nLoad]) { const m = loadErrors[nLoad]; setTimeout(() => this.emit({ type: 'ERROR', payload: m }), 3); return; }
           const be = backend === 'webgpu' && p.preferGpu !== false ? 'webgpu' : 'wasm';
           setTimeout(() => { this.emit({ type: 'BACKEND', payload: { backend: be, dtype: p.dtype } }); this.emit({ type: 'MODEL_READY', payload: { device: be } }); }, 3);
+        } else if (msg.type === 'RUN_CHUNK' && p.gapFill) {
+          // 覆核 r2 N2：接縫補聽（不算入一般段落的嘗試次數）；預設回空結果，gapSegments 可指定
+          w.__workerLog.push({ type: 'GAP_RUN', segIdx: p.segIdx, startSec: p.startSec, sec: (p.audioData?.byteLength ?? 0) / 4 / 16000, t: performance.now() });
+          const gs = (gapSegments as any)[p.segIdx];
+          setTimeout(() => {
+            if (gs === 'error') this.emit({ type: 'CHUNK_ERROR', payload: { error: 'gap fail', segIdx: p.segIdx } });
+            else this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: gs ?? [] }, segIdx: p.segIdx, startSec: p.startSec } });
+          }, 3);
         } else if (msg.type === 'RUN_CHUNK') {
           const k = (w.__attempts[p.segIdx] = (w.__attempts[p.segIdx] ?? -1) + 1);
           w.__workerLog.push({ type: 'RUN_CHUNK', segIdx: p.segIdx, attempt: k, dtype: w.__dtype, w: this.id, t: performance.now(), prompt: p.promptText ?? null });
@@ -138,7 +146,7 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
       terminate() { this.dead = true; }
     }
     w.Worker = FakeWorker;
-  }, { segments: cfg.segments, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm', loadErrors: cfg.loadErrors ?? [] });
+  }, { segments: cfg.segments, gapSegments: cfg.gapSegments ?? {}, rules: cfg.rules ?? [], backend: cfg.backend ?? 'wasm', loadErrors: cfg.loadErrors ?? [] });
   await page.route('**/opencc-js@*/dist/umd/cn2t.js', (route) =>
     route.fulfill({ contentType: 'application/javascript', body: 'window.OpenCC = { Converter: () => (t) => t };' }));
 }
