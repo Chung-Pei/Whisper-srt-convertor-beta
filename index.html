@@ -2232,6 +2232,9 @@ function stitchSeam(prevTail, nextWords, ovEnd) {
       const q = mb + (p - ma);
       let nf = 0;
       while (nf < headN && b.st[nf + 1] <= q) nf++;   // 後一窗從「包含第 q 個字元」的字開始保留（跨邊界的字寧重勿漏）
+      // 覆核 r3 N1′：涵蓋檢查。前一窗要丟掉的字，開始時間不可明顯早於後一窗保留的第一個字（平行句「抗體的結構，抗體的功能」），
+      // 否則換下一個候選；都不符 → 走時間法（寧重勿漏）。
+      if (nf < B.length && A.slice(k).some(function (x) { return x.s < B[nf].s - 0.3; })) continue;
       return { keepPrev: k, nextFrom: nf, how: 'text' };
     }
   }
@@ -2251,11 +2254,16 @@ const SEAM_GAP_MIN_SEC = 1.5, SEAM_GAP_LOOKBACK_SEC = 10, SEAM_GAP_LOOKAHEAD_SEC
 function seamGapRange(prevEnd, nextFirst, segStart, leadSec, prevStart) {
   if (prevEnd == null && nextFirst == null) return null;   // 兩窗都沒字：多半是安靜的段落
   const lead = leadSec || 0;
-  const g0 = Math.max(prevEnd != null ? prevEnd : (prevStart != null ? prevStart : segStart - SEAM_GAP_LOOKBACK_SEC), segStart - SEAM_GAP_LOOKBACK_SEC);
-  const g1 = Math.min(nextFirst != null ? nextFirst : segStart + lead, segStart + lead + SEAM_GAP_LOOKAHEAD_SEC);
+  const r0 = prevEnd != null ? prevEnd : (prevStart != null ? prevStart : segStart - SEAM_GAP_LOOKBACK_SEC);
+  const r1 = nextFirst != null ? nextFirst : segStart + lead;
+  const g0 = Math.max(r0, segStart - SEAM_GAP_LOOKBACK_SEC);
+  const g1 = Math.min(r1, segStart + lead + SEAM_GAP_LOOKAHEAD_SEC);
   if (g1 - g0 <= SEAM_GAP_MIN_SEC) return null;
   if (g1 < segStart - 0.5 || g0 > segStart + lead) return null;   // 空白不在接縫附近
-  return { from: g0, to: g1 };
+  // 覆核 r3 S-l：空白比補聽範圍更長（被截斷）→ clipped，呼叫端對超出的部分加待確認標記
+  // （前一窗沒有字時 r0 只是視窗起點，不算真的空白延伸，不標）
+  const clipped = (prevEnd != null && r0 < g0 - 0.5) || (nextFirst != null && r1 > g1 + 0.5);
+  return { from: g0, to: g1, clipped: clipped, rawFrom: r0, rawTo: r1 };
 }
 
 /** 純函式（覆核 r2 N2）：這段音訊是不是大致有聲音（0.1 秒一格，音量 RMS >0.01 的格數 ≥25%）。安靜的接縫不補聽，避免模型在靜音裡編字。 */
@@ -5996,7 +6004,19 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
           const keptPrev = pending.words.slice(0, sm.keepPrev), keptNext = body.slice(sm.nextFrom);
           // 覆核 r2 N2：文字沒對上時，檢查接縫有沒有一段兩窗都沒輸出的空白；有聲音就把那一小段（跨兩窗）再聽一次補進來
           let gapWords = [];
-          const gap = sm.how === 'text' ? null : seamGapRange(pending.lastEnd, keptNext.length ? keptNext[0].s : null, seg.startSec, seg.leadSec, pending.start);
+          let gap = sm.how === 'text' ? null : seamGapRange(pending.lastEnd, keptNext.length ? keptNext[0].s : null, seg.startSec, seg.leadSec, pending.start);
+          // 覆核 r3 S-m：續傳後第一個接縫，續傳點之前已經有字幕，不當成空白
+          if (gap && resumeSec != null && gap.from < resumeSec) gap = (gap.to - resumeSec > SEAM_GAP_MIN_SEC) ? { ...gap, from: resumeSec, clipped: false } : null;
+          if (gap && gap.clipped) {
+            // 覆核 r3 S-l：空白超出補聽範圍的部分不會補聽 → 那部分有說話聲才加一筆待確認（老師停下來寫黑板的安靜空白不標）
+            const SRc = SR, outer = [];
+            if (gap.rawFrom < gap.from - 0.5 && pending.data) outer.push(pending.data.subarray(Math.max(0, Math.floor((Math.max(gap.rawFrom, pending.start) - pending.start) * SRc)), Math.max(0, Math.min(pending.data.length, Math.ceil((gap.from - pending.start) * SRc)))));
+            if (gap.rawTo > gap.to + 0.5 && seg.data) outer.push(seg.data.subarray(Math.max(0, Math.floor((gap.to - seg.startSec) * SRc)), Math.max(0, Math.min(seg.data.length, Math.ceil((gap.rawTo - seg.startSec) * SRc)))));
+            if (!outer.some((x) => x.length > SRc && mostlyVoiced(x, SRc))) gap = { ...gap, clipped: false };
+          }
+          if (gap && gap.clipped) {
+            reviewMarks.push({ startSec: Math.max(0, Math.min(gap.rawFrom, gap.from) - 2), endSec: Math.max(gap.rawTo, gap.to), reason: '這附近有一段沒有字幕，可能漏字，建議重聽', kind: 'seam' });
+          }
           if (gap && pending.data && seg.data) {
             const g0 = Math.max(pending.start, gap.from - 1), g1 = Math.min(seg.endSec, gap.to + 1);
             const parts = [];
@@ -6018,9 +6038,23 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
                 log(gapWords.length
                   ? `🔎 ${clockText(gap.from)}～${clockText(gap.to)} 兩段接縫處原本沒有字，已補聽一次，補回 ${gapWords.length} 個字`
                   : `🔎 ${clockText(gap.from)}～${clockText(gap.to)} 兩段接縫處補聽一次，沒有聽到說話`, 'info');
+                // 覆核 r3 S-n：補聽結果本身鬼打牆（已截尾）→ 一樣在預覽標記
+                if (gr.evt.payload.stats?.flagged) {
+                  reviewMarks.push({ startSec: Math.max(0, gap.from - 2), endSec: gap.to, reason: '這段一直重複同一句話或同一個詞，已自動截掉，可能漏字' });
+                }
               } else {
-                reviewMarks.push({ startSec: gap.from, endSec: gap.to, reason: '兩段接縫處可能漏字，建議重聽' });
+                reviewMarks.push({ startSec: Math.max(0, gap.from - 2), endSec: gap.to, reason: '兩段接縫處可能漏字，建議重聽', kind: 'seam' });   // S-k：往前留 2 秒
                 log(`⚠ ${clockText(gap.from)}～${clockText(gap.to)} 兩段接縫處補聽失敗，已標記待確認`, 'warn');
+                // 覆核 r3 S-i：逾時／當掉／記憶體不足 → 那個 Worker 可能還在跑，比照主段落重建再繼續（重建失敗只記錄，下一段照常處理）
+                if (gr.kind !== 'other') {
+                  try { worker = await reloadWorkerForRetry(gr.kind, runModel); }
+                  catch (reloadErr) {
+                    if (reloadErr.message === 'CANCELLED') throw reloadErr;
+                    worker = inferenceWorker;
+                    log(`⚠ 接縫補聽後重載模型失敗：${reloadErr.message}`, 'warn');
+                  }
+                  if (isCancelled) throw new Error('CANCELLED');
+                }
               }
             }
           }
@@ -6077,8 +6111,12 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       const list = skipped.map((k) => `第 ${k.idx + 1} 段（${fmtTime(k.startSec).slice(0, 8)} 起）`).join('、');
       log(`⚠ ${skipped.length} 段辨識失敗已跳過：${list}`, 'warn');
     }
-    if (reviewMarks.length > 0) showUvrNotice(`有 ${reviewMarks.length} 段可能漏字（模型一直重複，已自動截掉），已在下方預覽標出，可點選重聽確認。`, file && file.name);
-    if (loopSegs > 0) log(`⏲ 量測合計：${segTimes.length} 段，其中 ${loopSegs} 段出現重複迴圈（${reviewMarks.length} 段標記待確認）`, 'info');
+    if (reviewMarks.length > 0) {
+      // 覆核 r3 S-j：分開說原因（鬼打牆 vs 接縫），不把接縫寫成「模型一直重複」
+      const seamN = reviewMarks.filter((m) => m.kind === 'seam').length;
+      showUvrNotice(`有 ${reviewMarks.length} 段可能漏字${seamN > 0 ? `（其中 ${seamN} 段在兩段接縫處）` : ''}，已在下方預覽標出，可點選重聽確認。`, file && file.name);
+    }
+    if (loopSegs > 0) log(`⏲ 量測合計：${segTimes.length} 段，其中 ${loopSegs} 段出現重複迴圈（全部待確認標記共 ${reviewMarks.length} 段）`, 'info');
     // r9 覆核 N12：照抄提示詞被移除時，完成畫面也要說（不只寫在日誌），老師可回頭核對
     if (_promptLeak.segs > 0) {
       showUvrNotice(`有 ${_promptLeak.segs} 處是模型把提示詞原文照抄進字幕，已自動刪除（共 ${_promptLeak.words} 個字詞）。想核對的話，下方紀錄有寫是第幾段、從幾分幾秒開始。`, file && file.name);

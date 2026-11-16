@@ -167,6 +167,11 @@ test.describe('r10b Worker', () => {
       calls.length = 0; out.length = 0; script = function (c) { return c.prompt ? loopy : full; }; await run('短提示');
       const d3 = out.filter(function (m) { return m.type === 'CHUNK_DONE'; })[0].payload;
       res.retryOk = { calls: calls.slice(), stats: d3.stats, text: d3.result.chunks.map(function (x) { return x.text; }).join('') };
+      // 3b) 覆核 r3 S-o：有提示詞的鬼打牆 → 重試結果尾端是老師真的說「對、對、對」→ 仍採用重試（走真實重試採用流程）
+      const fullDui = { tokens: [100, 101, 102, 50257], chunks: [W('今天', 0), W('上課', 1), W('對、', 20), W('對、', 20.4), W('對、', 20.8)] };
+      calls.length = 0; out.length = 0; script = function (c) { return c.prompt ? loopy : fullDui; }; await run('短提示');
+      const d3b = out.filter(function (m) { return m.type === 'CHUNK_DONE'; })[0].payload;
+      res.retryDui = { calls: calls.slice(), stats: d3b.stats, text: d3b.result.chunks.map(function (x) { return x.text; }).join('') };
       // 4) 鬼打牆＋重試還是鬼打牆：保留截短版、標記待確認
       calls.length = 0; out.length = 0; script = function () { return loopy; }; await run('短提示');
       const d4 = out.filter(function (m) { return m.type === 'CHUNK_DONE'; })[0].payload;
@@ -218,6 +223,9 @@ test.describe('r10b Worker', () => {
     expect(o.retryOk.calls).toEqual([{ max_new_tokens: 440, hasStop: true, prompt: true }, { max_new_tokens: 444, hasStop: true, prompt: false }]);
     expect(o.retryOk.stats).toMatchObject({ loop: 'repeat2', retried: true, retryOk: true, flagged: false });
     expect(o.retryOk.text).toBe('今天上課講細胞激素');
+    expect(o.retryDui.calls.length).toBe(2);
+    expect(o.retryDui.stats).toMatchObject({ retried: true, retryOk: true, flagged: false });
+    expect(o.retryDui.text).toBe('今天上課對、對、對、');
     expect(o.retryBad.calls.length).toBe(2);
     expect(o.retryBad.stats).toMatchObject({ loop: 'repeat2', retried: true, retryOk: false, flagged: true });
     expect(o.retryBad.text).toBe('今天射音，');
@@ -270,7 +278,7 @@ test.describe('r10b 主程式與畫面', () => {
     const log = await page.locator('#logBox').innerText();
     expect(log).toContain('⏲ 段落 1：30.0 秒音訊花 6.0 秒（模型讀音訊 1 次、產生 118 個字詞單位）');
     expect(log).toContain('這段一直重複同一句話或同一個詞，已提早停止、截掉 12 個重複字詞；不帶提示詞重試一次：仍不理想，保留截短後的版本；已標記待確認（後面約 19.5 秒可能漏字）');
-    expect(log).toContain('其中 1 段出現重複迴圈（1 段標記待確認）');
+    expect(log).toContain('其中 1 段出現重複迴圈（全部待確認標記共 1 段）');
     expect(log).not.toMatch(/token|n-gram/i);
     await expect(page.locator('#uvrNotice')).toContainText('有 1 段可能漏字');
     // 預覽：待確認清單，點一下跳到該時間
@@ -388,7 +396,11 @@ test.describe('r10b 第 1 輪覆核修正', () => {
     expect(await page.locator('#logBox').innerText()).toContain('斷點續傳：從 0:40 繼續');
     const id = await page.locator('.batch-item.done').first().getAttribute('data-id');
     await page.locator(`.batch-item-preview-btn[data-id="${id}"]`).click();
-    await expect(page.locator(`.item-preview-panel[data-id="${id}"] .preview-review-item`)).toHaveCount(1);
+    // 續傳前的待確認保留 1 筆；另外這份測試音訊整段有聲、接縫附近卻好幾秒沒字 → 覆核 r3 S-l 會加「這附近有一段沒有字幕」
+    const items = page.locator(`.item-preview-panel[data-id="${id}"] .preview-review-item`);
+    await expect(items.filter({ hasText: '重複' })).toHaveCount(1);
+    await expect(items.filter({ hasText: '這附近有一段沒有字幕' }).first()).toBeVisible();
+    for (const t of await items.allInnerTexts()) expect(t).not.toMatch(/0:(0\d|[1-3]\d)\b.*這附近/);   // S-m：續傳點 0:40 之前不標
     await ctx.close();
   });
 
@@ -438,6 +450,9 @@ test.describe('r10b 第 2 輪覆核修正', () => {
         // 實例 2：「這個」在前一窗 25.0 秒、後一窗 26.8 秒 → 不可吞掉「抗體」
         zhege: join([w('這', 25.0), w('個', 25.2), w('抗', 25.6), w('體', 26.0, 26.6)],
                     [w('這', 26.8), w('個', 27.0), w('時候', 27.3), w('我們', 27.8), w('看', 28.2)], 30),
+        // 覆核 r3 N1′：平行句「抗體的結構，抗體的功能」：前一窗丟了沒講完的「抗體的功能」，後一窗從句首起頭 → 不可吞掉「結構」
+        para: join([w('抗體的', 25.0, 25.5), w('結構', 25.5, 25.9)], [w('抗體的', 26.0, 26.5), w('功能', 26.5, 26.9), w('也', 27.0)], 30),
+        paraChar: join([w('抗', 25.0), w('體', 25.17), w('的', 25.33), w('結', 25.5), w('構', 25.7)], [w('抗', 26.0), w('體', 26.17), w('的', 26.33), w('功', 26.5), w('能', 26.7), w('也', 27.0)], 30),
         // 時間相符的共同片段仍照常接（不重複）
         ok: join([w('抗', 25.0), w('原', 25.3), w('呈', 25.6), w('現', 25.9)], [w('抗', 25.1), w('原', 25.4), w('呈', 25.7), w('現', 26.0), w('細胞', 26.4)], 30),
         // 實測 154.5 秒：「三制五毫米」是一個字詞（153.0～154.2），「毫米」的時間要按位置內插才對得上 → 數字不重複
@@ -464,6 +479,8 @@ test.describe('r10b 第 2 輪覆核修正', () => {
     });
     expect(r.igg.text).toContain('跟IgM都是抗體其中');
     expect(r.zhege.text).toContain('抗體');
+    expect(r.para.text).toContain('結構'); expect(r.para.text).toContain('功能');
+    expect(r.paraChar.text).toContain('結構'); expect(r.paraChar.text).toContain('功能');
     expect(r.ok).toEqual({ how: 'text', text: '抗原呈現細胞' });
     expect(r.two).toBe('time');
     expect(r.mm).toEqual({ how: 'text', text: '三制五毫米厚度' });
@@ -471,9 +488,9 @@ test.describe('r10b 第 2 輪覆核修正', () => {
     expect([r.dui12, r.igg6, r.sent3]).toEqual([true, true, true]);
     expect(r.tok30).toBe('repeat30');
     expect(r.trim30).toBe(54);   // 整句 27 個單位，重複 3 次 → 截掉後 2 次
-    expect(r.gapA).toEqual({ from: 20.8, to: 27 });
+    expect(r.gapA).toMatchObject({ from: 20.8, to: 27, clipped: false });
     expect(r.gapB).toBeNull();
-    expect(r.gapC).toEqual({ from: 15, to: 27 });
+    expect(r.gapC).toMatchObject({ from: 15, to: 27, clipped: true });   // 覆核 r3 S-l：空白超出補聽範圍 → clipped（呼叫端加待確認）
     expect(r.gapD).toBeNull(); expect(r.gapE).toBeNull();
     expect(r.voiced).toBe(true); expect(r.silent).toBe(false);
     await ctx.close();
@@ -495,7 +512,8 @@ test.describe('r10b 第 2 輪覆核修正', () => {
 
   test('S-11 接縫兩窗都沒輸出 → 補聽一次補回；補聽失敗 → 待確認清單（N2）', async ({ browser }) => {
     test.setTimeout(120_000);
-    for (const mode of ['fill', 'fail'] as const) {
+    test.setTimeout(240_000);
+    for (const mode of ['fill', 'fail', 'oom', 'loop'] as const) {
       const ctx = await newCtx(browser); const page = await ctx.newPage();
       // 60 秒、不開 VAD → 視窗 [0,30] [25,55] [50,60]
       await installScriptedWorker(page, {
@@ -504,7 +522,7 @@ test.describe('r10b 第 2 輪覆核修正', () => {
           [{ text: 'B1', timestamp: [2, 2.5] }, { text: 'B2', timestamp: [25.5, 26] }],
           [{ text: 'C1', timestamp: [2, 3] }],
         ],
-        gapSegments: { 1: mode === 'fill' ? [{ text: '補字', timestamp: [2, 3] }] : 'error' },
+        gapSegments: { 1: mode === 'fill' ? [{ text: '補字', timestamp: [2, 3] }] : mode === 'loop' ? { flagged: true, chunks: [{ text: '補字', timestamp: [2, 3] }] } : mode === 'oom' ? 'oom' : 'error' },
       });
       await page.goto(BASE_URL);
       await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
@@ -523,8 +541,20 @@ test.describe('r10b 第 2 輪覆核修正', () => {
         expect(txt.indexOf('A2')).toBeLessThan(txt.indexOf('補字'));
         expect(txt.indexOf('補字')).toBeLessThan(txt.indexOf('B1'));
         expect(log).toContain('補回 1 個字');
+      } else if (mode === 'loop') {
+        // 覆核 r3 S-n：補聽結果本身鬼打牆 → 字照收、預覽標記
+        expect(txt).toContain('補字'); expect(txt).not.toContain('⚠');
+        const id = await page.locator('.batch-item.done').first().getAttribute('data-id');
+        await page.locator(`.batch-item-preview-btn[data-id="${id}"]`).click();
+        await expect(page.locator(`.item-preview-panel[data-id="${id}"] .preview-review-item`)).toHaveCount(1);
       } else {
         for (const k of ['A1', 'A2', 'B1', 'B2', 'C1']) expect(txt).toContain(k);
+        // 覆核 r3 S-j：完成訊息分開說接縫，不寫成「模型一直重複」
+        const notice = await page.locator('#uvrNotice').innerText();
+        expect(notice).toContain('其中 1 段在兩段接縫處'); expect(notice).not.toContain('模型一直重複');
+        // 覆核 r3 S-i：記憶體不足 → 補聽後重建 Worker 再繼續
+        const loads = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'LOAD_MODEL').length);
+        if (mode === 'oom') expect(loads).toBe(2); else expect(loads).toBe(1);
         expect(txt).not.toContain('⚠');
         const id = await page.locator('.batch-item.done').first().getAttribute('data-id');
         await page.locator(`.batch-item-preview-btn[data-id="${id}"]`).click();

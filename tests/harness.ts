@@ -124,6 +124,8 @@ export async function installScriptedWorker(page: Page, cfg: { segments: Seg[]; 
           const gs = (gapSegments as any)[p.segIdx];
           setTimeout(() => {
             if (gs === 'error') this.emit({ type: 'CHUNK_ERROR', payload: { error: 'gap fail', segIdx: p.segIdx } });
+            else if (gs === 'oom') this.emit({ type: 'CHUNK_ERROR', payload: { error: 'RangeError: Array buffer allocation failed (out of memory)', segIdx: p.segIdx } });
+            else if (gs && gs.flagged) this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: gs.chunks }, segIdx: p.segIdx, startSec: p.startSec, stats: { flagged: true, loop: 'repeat2' } } });
             else this.emit({ type: 'CHUNK_DONE', payload: { result: { chunks: gs ?? [] }, segIdx: p.segIdx, startSec: p.startSec } });
           }, 3);
         } else if (msg.type === 'RUN_CHUNK') {
