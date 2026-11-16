@@ -267,6 +267,8 @@ test.describe('r10b 主程式與畫面', () => {
     await page.goto(BASE_URL);
     await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
     await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+    // r10c：替身字幕很稀疏，會被「可疑字幕」標出；這裡只驗鬼打牆／接縫標記（可疑字幕另見 round21 H-01）
+    await page.evaluate(() => { (document.getElementById('p_halluc_gap') as HTMLInputElement).value = '999'; (document.getElementById('p_halluc_speed') as HTMLInputElement).value = '999'; });
     await page.locator('#fileInput').setInputFiles({ name: 'mid.wav', mimeType: 'audio/wav', buffer: wav(60) });
     await page.locator('#startBtn').click();
     await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
@@ -527,6 +529,8 @@ test.describe('r10b 第 2 輪覆核修正', () => {
       await page.goto(BASE_URL);
       await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
       await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+      // r10c：替身字幕很稀疏，會被「可疑字幕」標出；這裡只驗鬼打牆／接縫標記（可疑字幕另見 round21 H-01）
+      await page.evaluate(() => { (document.getElementById('p_halluc_gap') as HTMLInputElement).value = '999'; (document.getElementById('p_halluc_speed') as HTMLInputElement).value = '999'; });
       await page.locator('#fileInput').setInputFiles({ name: 'gap.wav', mimeType: 'audio/wav', buffer: wav(60) });
       await page.locator('#startBtn').click();
       await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
