@@ -189,3 +189,58 @@ test.describe('r10c 可疑字幕併入待確認', () => {
     await ctx.close();
   });
 });
+
+// ── r10c (b)：顯示卡 vs CPU 自動試用（替身 Worker；沙盒沒有顯示卡，真機速度要使用者實測）
+async function runTrial(page: Page, cpuMs: number) {
+  await page.addInitScript(() => { if (!(navigator as any).gpu) Object.defineProperty(navigator, 'gpu', { value: { requestAdapter: async () => ({}) }, configurable: true }); });
+  const st = (ms: number) => ({ ms, audioSec: 30, enc: 1, dec: 100, newTokens: 98, loop: null, mode: 'fast', retried: false, flagged: false });
+  await installScriptedWorker(page, { segments: SEGS, backend: 'webgpu', rules: [
+    { segIdx: 0, stats: st(20000) }, { segIdx: 1, stats: st(6000) }, { segIdx: 2, stats: st(cpuMs) }, { segIdx: 3, stats: st(5000) }] });
+  await page.goto(BASE_URL);
+  await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+  await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+  await page.locator('#fileInput').setInputFiles({ name: 'g.wav', mimeType: 'audio/wav', buffer: wav(100) });
+  await page.locator('#startBtn').click();
+  await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+}
+const loadsOf = (page: Page) => page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'LOAD_MODEL').map((x: any) => x.preferGpu));
+const chunkWorkers = (page: Page) => page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'RUN_CHUNK').map((x: any) => x.w));
+
+test.describe('r10c 顯示卡 vs CPU 自動試用', () => {
+  test('G-01 CPU 比較快 → 後面改用 CPU、記住；下次直接用 CPU；字幕完整', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await runTrial(page, 3000);
+    expect(await loadsOf(page)).toEqual([true, false]);   // 先顯示卡，第 2 段後換 CPU，不再換回
+    const ws = await chunkWorkers(page);
+    expect(ws[0]).toBe(ws[1]); expect(ws[2]).not.toBe(ws[1]); expect(ws[3]).toBe(ws[2]);
+    const log = await page.locator('#logBox').innerText();
+    expect(log).toContain('正在比較顯示卡和 CPU 哪個比較快');
+    expect(log).toContain('這台電腦用 CPU 比較快（每 1 分鐘音訊：CPU 約 6 秒、顯示卡約 12 秒）');
+    expect(log).not.toMatch(/token|WASM\b/);
+    expectComplete(await downloadText(page));
+    const pick = await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']);
+    expect(pick.pick).toBe('wasm');
+    // 下次：直接用 CPU，不再比
+    const p2 = await ctx.newPage();
+    await runTrial(p2, 3000);
+    expect(await loadsOf(p2)).toEqual([false]);
+    expect(await p2.locator('#logBox').innerText()).not.toContain('正在比較');
+    await ctx.close();
+  });
+
+  test('G-02 顯示卡比較快 → 換回顯示卡、記住；字幕完整不重不漏', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await runTrial(page, 15000);
+    expect(await loadsOf(page)).toEqual([true, false, true]);
+    expect(await page.locator('#logBox').innerText()).toContain('這台電腦用顯示卡比較快');
+    expectComplete(await downloadText(page));
+    const pick = await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']);
+    expect(pick.pick).toBe('webgpu');
+    const p2 = await ctx.newPage();
+    await runTrial(p2, 15000);
+    expect(await loadsOf(p2)).toEqual([true]);
+    await ctx.close();
+  });
+});

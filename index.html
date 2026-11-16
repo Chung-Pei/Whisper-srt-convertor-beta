@@ -3649,8 +3649,57 @@ function markGpuFailed(modelId, why) {
 /** 預設是否先試 WebGPU。v24 r8：低記憶體等級（iOS、deviceMemory ≤ 4）載入 medium／large 時不用 WebGPU——
  *  Worker 在 GPU 路徑固定用 fp32 或 encoder fp16，不受記憶體分級的 dtype 限制；iOS 超過上限會直接把分頁砍掉，
  *  不會有任何錯誤可讓重試機制接手。 */
+// ── r10c (b)：顯示卡 vs CPU 自動試用 ─────────────────────────────────
+// 內顯（例如 Intel UHD）不一定比多核心 CPU 快。第一次用某個模型時：先用顯示卡跑（第 1 段算暖機不計），
+// 量第 2 段的速度 → 換 CPU 跑下一段（真的拿來用、不浪費）→ 比每秒音訊耗時，挑快的繼續；結果記在這台電腦，之後直接用快的。
+// 只對 base／small（CPU 也能用的大小）做；medium／large 在 CPU 太慢，一律顯示卡。
+const BACKEND_PICK_KEY = 'whisper-backend-pick';
+const BACKEND_PICK_TTL_MS = 30 * 24 * 3600 * 1000;   // 30 天後重新比一次（驅動或瀏覽器可能更新）
+function readBackendPick(modelId) {
+  try {
+    const all = JSON.parse(localStorage.getItem(BACKEND_PICK_KEY) || '{}');
+    const r = all[modelId];
+    if (!r || !(Date.now() - (r.at || 0) < BACKEND_PICK_TTL_MS)) return null;
+    return r;
+  } catch (_) { return null; }
+}
+function writeBackendPick(modelId, rec) {
+  try {
+    const all = JSON.parse(localStorage.getItem(BACKEND_PICK_KEY) || '{}');
+    all[modelId] = { ...rec, at: Date.now() };
+    localStorage.setItem(BACKEND_PICK_KEY, JSON.stringify(all));
+  } catch (_) {}
+}
+function backendTrialEligible(modelId) {
+  return isWebGPUSupported() && !_gpuFailedModels.has(modelId) && /whisper-(base|small)\b/i.test(String(modelId)) && !readBackendPick(modelId);
+}
+/** 換後端重載（試用與挑選結果共用）；終止舊 Worker，釋放記憶體 */
+async function switchWorkerBackend(modelId, gpu) {
+  const dtype = await chooseDtype(modelId);
+  let worker = createWorker();
+  workerReady = false;
+  const onBackend = (e) => { if (e.data?.type === 'BACKEND') applyBackendInfo(e.data.payload ?? {}); };
+  worker.addEventListener('message', onBackend);
+  try {
+    worker = await loadModelOnWorker(worker, modelId, dtype, { preferGpu: gpu, afterGpuFail: !gpu }, onBackend);
+  } finally {
+    worker.removeEventListener('message', onBackend);
+    inferenceWorker?.removeEventListener('message', onBackend);
+  }
+  workerReady = true;
+  loadedModel = modelId;
+  return worker;
+}
+/** 每秒音訊耗時（只拿正常段落：沒鬼打牆、沒重試、長度 ≥5 秒） */
+function trialRate(st) {
+  if (!st || !(st.ms > 0) || st.loop || st.retried || !(st.audioSec >= 5)) return null;
+  return st.ms / 1000 / st.audioSec;
+}
+
 function defaultPreferGpu(modelId) {
   if (!isWebGPUSupported() || _gpuFailedModels.has(modelId)) return false;
+  const pick = readBackendPick(modelId);
+  if (pick && pick.pick === 'wasm') return false;   // r10c：這台電腦試過，CPU 比較快
   const big = /whisper-(medium|large)/i.test(String(modelId));
   return !(big && detectMemoryTier().tier === 'low');
 }
@@ -5928,6 +5977,8 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     const flushPending = () => { if (pending) { commitWords(pending.words); pending = null; } };
 
     let nextSegPromise = gen.next();
+    // r10c (b)：顯示卡 vs CPU 自動試用（至少要還有 4 段才值得比）
+    let _trial = (_lastBackend === 'webgpu' && backendTrialEligible(runModel) && windows.length - i >= 4) ? { stage: 'gpu', gpuSeen: 0, gpuRate: null } : null;
 
     const _resumeStartedAt = Date.now();
     let _resumeSavedIdx = i;
@@ -6113,6 +6164,41 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         if (!_etaAnnounced && est && segTimes.length >= 2 && remain > 60) {
           _etaAnnounced = true;
           log(`⏱ 依目前速度，這個檔案還要${plainDuration(est.remainSec)}（每 1 分鐘的音訊約需 ${Math.max(1, Math.round(est.secPerAudioSec * 60))} 秒）。接上電源、關掉其他程式會比較快。`, 'ok');
+        }
+      }
+
+      // ── r10c (b)：顯示卡 vs CPU 自動試用（只在第一次用這個模型時）
+      if (_trial && !isCancelled) {
+        const rate = trialRate(st);
+        if (_trial.stage === 'gpu' && _lastBackend === 'webgpu') {
+          _trial.gpuSeen++;
+          if (_trial.gpuSeen >= 2 && rate != null) {   // 第 1 段是顯示卡暖機（編譯著色器），不算
+            _trial.gpuRate = rate;
+            if (i < windows.length) {
+              log('🧪 第一次用這個模型：正在比較顯示卡和 CPU 哪個比較快（只比一次，字幕照常產生）…', 'info');
+              try { worker = await switchWorkerBackend(runModel, false); _trial.stage = 'cpu'; }
+              catch (e) {
+                if (e?.message === 'CANCELLED') throw e;
+                log('（CPU 模式載入不了，繼續用顯示卡）', 'info');
+                writeBackendPick(runModel, { pick: 'webgpu', gpuRate: rate });
+                worker = await switchWorkerBackend(runModel, true); _trial = null;
+              }
+            }
+          }
+        } else if (_trial.stage === 'gpu' && _lastBackend !== 'webgpu') {
+          _trial = null;   // 顯示卡根本沒用上（失敗退回 CPU），不用比
+        } else if (_trial.stage === 'cpu' && rate != null) {
+          const g = _trial.gpuRate, c = rate;
+          const perMin = (r) => Math.max(1, Math.round(r * 60));
+          if (c < g) {
+            writeBackendPick(runModel, { pick: 'wasm', gpuRate: g, cpuRate: c });
+            log(`✓ 比較結果：這台電腦用 CPU 比較快（每 1 分鐘音訊：CPU 約 ${perMin(c)} 秒、顯示卡約 ${perMin(g)} 秒），接下來都用 CPU。`, 'ok');
+          } else {
+            writeBackendPick(runModel, { pick: 'webgpu', gpuRate: g, cpuRate: c });
+            log(`✓ 比較結果：這台電腦用顯示卡比較快（每 1 分鐘音訊：顯示卡約 ${perMin(g)} 秒、CPU 約 ${perMin(c)} 秒），換回顯示卡。`, 'ok');
+            if (i < windows.length) worker = await switchWorkerBackend(runModel, true);
+          }
+          _trial = null;
         }
       }
 
