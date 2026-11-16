@@ -2197,6 +2197,8 @@ function stitchSeam(prevTail, nextWords, ovEnd) {
   // 只比文字會接錯位置而吞字。收集所有 ≥2 字的共同片段（依長度由長到短），取第一個時間相符的；都不符 → 走下面的時間法（前一窗全留）。
   const wordAt = function (x) { const o = []; for (let w = 0; w + 1 < x.st.length; w++) for (let q = x.st[w]; q < x.st[w + 1]; q++) o[q] = w; return o; };
   const wa = wordAt(a), wb = wordAt(b);
+  // 一個「字詞」可能含好幾個字（例如「三制五毫米」）：每個字的時間在該字詞的開始～結束間按位置內插
+  const charT = function (W, x, wo, q) { const w = wo[q], st = x.st[w], n = x.st[w + 1] - st, s0 = W[w].s, e0 = W[w].e != null ? W[w].e : s0; return n > 1 ? s0 + (e0 - s0) * (q - st) / n : s0; };
   const cands = [];
   let prev = new Array(b.cs.length + 1).fill(0);
   for (let i = 1; i <= a.cs.length; i++) {
@@ -2214,7 +2216,7 @@ function stitchSeam(prevTail, nextWords, ovEnd) {
   cands.sort(function (x, y) { return y.len - x.len; });
   for (const c of cands) {
     const ma = c.ea - c.len, mb = c.eb - c.len, best = c.len;
-    const dt = Math.abs(A[wa[ma]].s - B[wb[mb]].s);
+    const dt = Math.abs(charT(A, a, wa, ma) - charT(B, b, wb, mb));
     if (dt > SEAM_TIME_TOL_SEC) continue;
     if (best === 2 && dt > SEAM_TIME_TOL_SEC / 2) continue;   // 只有 2 個字的片段，時間要更接近才算
     const mid = ma + best / 2;

@@ -440,6 +440,8 @@ test.describe('r10b 第 2 輪覆核修正', () => {
                     [w('這', 26.8), w('個', 27.0), w('時候', 27.3), w('我們', 27.8), w('看', 28.2)], 30),
         // 時間相符的共同片段仍照常接（不重複）
         ok: join([w('抗', 25.0), w('原', 25.3), w('呈', 25.6), w('現', 25.9)], [w('抗', 25.1), w('原', 25.4), w('呈', 25.7), w('現', 26.0), w('細胞', 26.4)], 30),
+        // 實測 154.5 秒：「三制五毫米」是一個字詞（153.0～154.2），「毫米」的時間要按位置內插才對得上 → 數字不重複
+        mm: join([w('三制五毫米', 153.0, 154.2)], [w('.5', 153.5, 153.7), w('毫米', 153.8, 154.2), w('，', 154.2), w('厚度', 154.4)], 155),
         // 只有 2 個字的片段時間差 0.8 秒（>0.5）→ 不接
         two: join([w('我', 25.0), w('們', 25.2), w('甲', 25.5)], [w('我', 25.8), w('們', 26.0), w('乙', 26.3)], 30).how,
         // N3：真實切法「對、」「I」「gG、」在尾端
@@ -464,6 +466,7 @@ test.describe('r10b 第 2 輪覆核修正', () => {
     expect(r.zhege.text).toContain('抗體');
     expect(r.ok).toEqual({ how: 'text', text: '抗原呈現細胞' });
     expect(r.two).toBe('time');
+    expect(r.mm).toEqual({ how: 'text', text: '三制五毫米厚度' });
     expect([r.dui3, r.dui11, r.igg3, r.igg5, r.hao3, r.sent2]).toEqual([false, false, false, false, false, false]);
     expect([r.dui12, r.igg6, r.sent3]).toEqual([true, true, true]);
     expect(r.tok30).toBe('repeat30');
