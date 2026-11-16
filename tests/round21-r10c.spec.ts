@@ -1,8 +1,10 @@
 // tests/round21-r10c.spec.ts — r10c 暫停／繼續、幻覺偵測併入待確認、顯示卡自動試用
 //   P-01  暫停 → 目前這段做完才停、存斷點、顯示「已暫停」；繼續 → 不重載模型，字幕完整不重不漏
 //   P-02  暫停中關掉網頁 → 重開出現「恢復任務」→ 選同一檔案從斷點接續，字幕完整不重不漏
+//   H-01  可疑字幕（套話／孤立短句、字速異常、只有括號）→ 預設在預覽「待確認」標出、匯出字幕無 ⚠；老師重述不誤判
+//   H-02  勾選進階「匯出時在可疑字幕前加 ⚠」才寫 ⚠
 import { test, expect, type Page } from '@playwright/test';
-import { newCtx, installScriptedWorker, BASE_URL, type Seg } from './harness';
+import { newCtx, openWithHook, installScriptedWorker, BASE_URL, type Seg } from './harness';
 import { setToggles, downloadText } from './helpers';
 
 function wav(sec: number): Buffer {
@@ -110,6 +112,80 @@ test.describe('r10c 暫停／繼續', () => {
     expect(ran[0]).toBeGreaterThanOrEqual(1);   // 沒有從頭重跑
     expect(await p2.locator('#logBox').innerText()).toContain('斷點續傳');
     expectComplete(await downloadText(p2));
+    await ctx.close();
+  });
+});
+
+// 60 秒：一般句子＋「謝謝觀看」（套話）＋孤立短句＋字速異常＋只有括號＋老師重述
+const HSEGS: Seg[] = [
+  [{ text: '抗體的結構，抗體的功能', timestamp: [1, 4] }, { text: '今天講補體', timestamp: [4.5, 6] }, { text: '〔音樂〕', timestamp: [7, 8] },
+   { text: '補體系統有三條路徑', timestamp: [9, 11] }, { text: '巨噬細胞巨噬細胞巨噬細胞吞噬作用', timestamp: [12, 12.6] }, { text: '然後我們看下一張', timestamp: [13.5, 15] },
+   { text: '謝謝觀看', timestamp: [21, 22] }],
+  [{ text: '好那我們繼續', timestamp: [10, 12] }, { text: '嗯', timestamp: [17, 17.5] }, { text: '最後一句', timestamp: [24, 26] }],
+];
+async function runH(page: Page, on: string[]) {
+  await installScriptedWorker(page, { segments: HSEGS });
+  await page.goto(BASE_URL);
+  await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+  await setToggles(page, on, ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_merge', 'tog_split', 'tog_mindur', 'tog_overlap'].concat(on.includes('tog_hallucination') ? [] : ['tog_hallucination']));
+  await page.locator('#fileInput').setInputFiles({ name: 'h.wav', mimeType: 'audio/wav', buffer: wav(50) });
+  await page.locator('#startBtn').click();
+  await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+}
+
+test.describe('r10c 可疑字幕併入待確認', () => {
+  test('H-00 純函式：舊的重複詞組判定已拿掉；三項＋套話仍偵測', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, ['detectHallucinations', 'hallucinationMarks'], 'new');
+    const r = await page.evaluate(() => {
+      const T = (window as any).__t;
+      const subs = [
+        { start: 0, end: 3, text: '抗體的結構，抗體的功能' },
+        { start: 3.2, end: 5, text: 'IgG IgG 是最多的' },
+        { start: 5.2, end: 7, text: '〔音樂〕' },
+        { start: 7.2, end: 7.5, text: '補體補體補體補體補體' },
+        { start: 20, end: 21, text: '嗯好' },
+        { start: 30, end: 33, text: '停了很久之後老師開始講新的一章內容' },
+        { start: 33.2, end: 35, text: '請不吝點贊訂閱' },
+      ];
+      return T.detectHallucinations(subs).map((s: any) => (s._halluReasons || []).map((x: any) => x.code).join(','));
+    });
+    expect(r).toEqual(['', '', 'bracket', 'speed', 'isolated', '', 'phrase']);
+    await ctx.close();
+  });
+
+  test('H-01 預設：預覽有待確認標記（可疑字幕）、匯出字幕無 ⚠、完成畫面一句話', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await runH(page, []);
+    await expect(page.locator('#tog_hallucination')).not.toBeChecked();
+    const txt = await downloadText(page);
+    expect(txt).not.toContain('⚠');
+    for (const k of ['抗體的結構，抗體的功能', '謝謝觀看', '最後一句']) expect(txt).toContain(k);
+    await expect(page.locator('#uvrNotice')).toContainText('句字幕可能有誤');
+    const id = await page.locator('.batch-item.done').first().getAttribute('data-id');
+    await page.locator(`.batch-item-preview-btn[data-id="${id}"]`).click();
+    const panel = page.locator(`.item-preview-panel[data-id="${id}"]`);
+    await expect(panel.locator('.preview-review-title')).toContainText('字幕可能有誤');
+    await expect(panel.locator('.preview-review-title')).toContainText('字幕檔裡不會有任何記號');
+    const items = await panel.locator('.preview-review-item').allInnerTexts();
+    const all = items.join('\n');
+    expect(all).toContain('只有括號');
+    expect(all).toContain('套話');
+    expect(all).toContain('每秒');
+    expect(all).toContain('前後都很久沒有字幕');
+    expect(all).not.toMatch(/0:0[0-4].*(套話|前後)/);   // 老師重述「抗體…抗體」不標
+    const times = items.map((t) => t.slice(0, 8));
+    expect([...times].sort()).toEqual(times);   // 依時間排序
+    await ctx.close();
+  });
+
+  test('H-02 勾選進階「匯出時在可疑字幕前加 ⚠」才寫 ⚠', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await runH(page, ['tog_hallucination']);
+    const txt = await downloadText(page);
+    expect(txt).toContain('⚠ 謝謝觀看');
+    expect(txt).not.toContain('⚠ 抗體的結構');
     await ctx.close();
   });
 });

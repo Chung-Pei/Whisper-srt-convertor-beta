@@ -1719,14 +1719,14 @@
 
       <div class="post-toggle-row" style="border-top:1px solid rgba(255,255,255,0.04);margin-top:0.2rem;padding-top:0.45rem;">
         <div class="post-toggle-info">
-          <div class="post-toggle-name">🔍 幻覺字幕偵測</div>
-          <div class="post-toggle-desc">偵測 Whisper 常見幻覺症狀（重複詞組、長靜音後突發字幕、速度異常段落），以 ⚠ 標記可疑字幕。注意：⚠ 會寫進字幕檔，燒進影片也看得到；只想知道哪裡要重聽，關著即可（重複迴圈本來就會在預覽標出）</div>
+          <div class="post-toggle-name">⚠ 匯出時在可疑字幕前加 ⚠（進階）</div>
+          <div class="post-toggle-desc">可疑字幕（像「謝謝觀看」這類套話、前後很久沒聲音卻冒出的短句、字速太快、只有括號的聲音描述）一律會自動在下方預覽標出，字幕檔保持乾淨。打開這個開關，才會把 ⚠ 也寫進字幕檔（燒進影片也看得到），一般不需要。</div>
         </div>
         <label class="toggle-switch"><input type="checkbox" id="tog_hallucination"><span class="toggle-slider"></span></label>
       </div>
       <div class="post-params cols2" id="params_hallucination" style="display:none;">
-        <div class="param-group"><label>靜音偵測閾值（秒）gap 超過此值視為可疑</label><input type="number" id="p_halluc_gap" value="3.0" min="1.0" max="10.0" step="0.5"></div>
-        <div class="param-group"><label>速度閾值（字/秒）超過視為可疑</label><input type="number" id="p_halluc_speed" value="12" min="6" max="30" step="1"></div>
+        <div class="param-group"><label>前後沒字幕超過幾秒，中間的短句算可疑</label><input type="number" id="p_halluc_gap" value="3.0" min="1.0" max="10.0" step="0.5"></div>
+        <div class="param-group"><label>每秒超過幾個字算太快</label><input type="number" id="p_halluc_speed" value="12" min="6" max="30" step="1"></div>
       </div>
       <div class="dict-editor" id="dictEditor">
         <div class="dict-editor-toolbar">
@@ -4492,7 +4492,10 @@ function buildPreviewPanel(item) {
     box.className = 'preview-review';
     const title = document.createElement('div');
     title.className = 'preview-review-title';
-    title.textContent = `有 ${marks.length} 段可能漏字，點一下就能跳過去重聽確認（字幕檔裡不會有任何記號）`;
+    const susN = marks.filter((m) => m.kind === 'suspect').length, lostN = marks.length - susN;
+    const what = susN === 0 ? `有 ${lostN} 段可能漏字` : lostN === 0 ? `有 ${susN} 句字幕可能有誤`
+      : `有 ${marks.length} 處要確認（${lostN} 段可能漏字、${susN} 句字幕可能有誤）`;
+    title.textContent = `${what}，點一下就能跳過去重聽確認（字幕檔裡不會有任何記號）`;
     box.appendChild(title);
     marks.forEach((m, k) => {
       const b = document.createElement('button');
@@ -6179,6 +6182,16 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     const chunks = await applyPostProcessing(labelledChunks, { cfg: postCfg });
     const postCount = Object.values(postCfg).filter(v => v === true).length;
     if (postCount > 0) log(`✓ 後處理套用（${postCount} 項）`, 'ok');
+    // r10c (c)：可疑字幕（套話／孤立短句、字速異常、只有括號）併入預覽待確認清單；預設開、不進字幕檔
+    try {
+      const hm = hallucinationMarks(chunks, postCfg.hallucGap, postCfg.hallucSpeed);
+      if (hm.length) {
+        for (const m of hm) reviewMarks.push(m);
+        reviewMarks.sort((a, b) => a.startSec - b.startSec);
+        log(`🔍 有 ${hm.length} 句字幕可能有誤（例如影片常見套話、字速太快），已在預覽標出`, 'info');
+        showUvrNotice(`有 ${hm.length} 句字幕可能有誤，已在下方預覽標出，可點選重聽確認（字幕檔裡不會有記號）。`, file && file.name);
+      }
+    } catch (_) { /* 偵測失敗不影響字幕 */ }
     const fmt2 = document.getElementById('outFormat').value;
 
     if (fmt2 === 'srt')       outputContent = chunks.length === 0 ? `1\n00:00:00,000 --> 00:00:05,000\n（無辨識結果）` : (diarSegments ? chunksToSrtWithSpeakers(chunks) : chunksToSrt(chunks));
@@ -7480,84 +7493,39 @@ async function applyFuzzyMedicalDict(subs, dict, threshold = FUZZY_THRESHOLD_DEF
  *  4. 孤立非語言音（僅含括號標記）
  *  回傳帶 _hallucination 旗標的 subs 陣列
  */
+// r10c (c)：舊「幻覺字幕偵測」併入預覽「待確認」清單（預設開、不寫進字幕檔）。
+// 重複詞組改由轉錄當下的鬼打牆偵測負責（舊的「同一行 2–4 字片段出現 2 次」會把老師的重述大量誤判，已拿掉）。
+// 留下三項＋常見套話：① 前後都長時間沒字、孤零零冒出的一句短字幕（或常見套話）② 字速異常 ③ 只有括號的聲音描述。
+const HALLU_PHRASE_RE = /(謝謝(大家)?(收看|觀看)|請不吝|點贊|點讚|訂閱|字幕(由|製作|by)|Amara|明鏡與點點|中文字幕)/i;
 function detectHallucinations(subs, gapThreshold = 3.0, speedThreshold = 12) {
   if (!subs || subs.length === 0) return subs;
-
-  // ── 工具：提取 n-gram ──────────────────────────────────────
-  function getNgrams(text, n) {
-    const words = text.trim().split(/\s+/);
-    if (words.length < n) return new Set();
-    const grams = new Set();
-    for (let i = 0; i <= words.length - n; i++) {
-      grams.add(words.slice(i, i + n).join(' '));
-    }
-    return grams;
-  }
-
-  function hasRepeatNgram(text, minN = 2) {
-    const clean = text.trim();
-    // 【邏輯修復】：中文無空格，改用字元級 n-gram（2–4字）偵測重複
-    const isCjk = /[\u4e00-\u9fff]/.test(clean);
-    if (isCjk) {
-      for (let n = 2; n <= 4; n++) {
-        for (let i = 0; i <= clean.length - n * 2; i++) {
-          const gram = clean.slice(i, i + n);
-          const escaped = gram.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const re = new RegExp(escaped, 'g');
-          if ((clean.match(re) || []).length >= 2) return true;
-        }
-      }
-      return false;
-    }
-    // 英文走原本空格切分邏輯
-    for (let n = minN; n <= 4; n++) {
-      const grams = [...getNgrams(clean, n)];
-      for (const g of grams) {
-        // 若同一 gram 出現 2 次以上則視為重複
-        const escaped = g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const re = new RegExp(escaped, 'g');
-        if ((clean.match(re) || []).length >= 2) return true;
-      }
-    }
-    return false;
-  }
-
-  const flagged = subs.map((s, i) => {
+  return subs.map((s, i) => {
     const reasons = [];
-    const text    = s.text ?? '';
-    const dur     = (s.end ?? 0) - (s.start ?? 0);
-    const chars   = text.replace(/\s/g, '').length;
-
-    // 症狀 1：重複 n-gram（≥2 詞）
-    if (chars > 4 && hasRepeatNgram(text, 2)) {
-      reasons.push('重複詞組');
-    }
-
-    // 症狀 2：前一字幕結束到本字幕開始 gap 超過閾值
-    if (i > 0) {
-      const prevEnd  = subs[i - 1].end ?? 0;
-      const gap      = (s.start ?? 0) - prevEnd;
-      if (gap > gapThreshold && chars > 2) {
-        reasons.push(`長靜音後突發（${gap.toFixed(1)}s）`);
-      }
-    }
-
-    // 症狀 3：字速異常（字/秒 > 閾值）
-    if (dur > 0 && chars / dur > speedThreshold) {
-      reasons.push(`速度異常（${(chars / dur).toFixed(1)} 字/s）`);
-    }
-
-    // 症狀 4：孤立非語言音（僅有括號內容）
-    if (/^[[(（「【].+[\])）」】]$/.test(text.trim())) {
-      reasons.push('孤立非語言音');
-    }
-
-    return reasons.length > 0
-      ? { ...s, _hallucination: true, _halluReasons: reasons }
-      : s;
+    const text  = (s.text ?? '').trim();
+    const dur   = (s.end ?? 0) - (s.start ?? 0);
+    const chars = text.replace(/\s/g, '').length;
+    const gapBefore = i > 0 ? (s.start ?? 0) - (subs[i - 1].end ?? 0) : (s.start ?? 0);
+    const gapAfter  = i < subs.length - 1 ? (subs[i + 1].start ?? 0) - (s.end ?? 0) : Infinity;
+    const brackets = /^[[(（「【〔].+[\])）」】〕]$/.test(text);
+    // ③ 只有括號
+    if (brackets) reasons.push({ code: 'bracket', text: '只有括號裡的聲音描述（例如〔音樂〕），可能不是說話內容' });
+    // ① 常見套話；或前後都很久沒字、孤零零的一句短字幕（課堂停頓後正常開講不會被標：後面通常緊接著下一句）
+    else if (HALLU_PHRASE_RE.test(text)) reasons.push({ code: 'phrase', text: '像影片常見的套話（例如「謝謝觀看」），可能不是老師說的，建議重聽' });
+    else if (chars > 0 && chars <= 15 && gapBefore > gapThreshold && gapAfter > gapThreshold)
+      reasons.push({ code: 'isolated', text: '前後都很久沒有字幕，中間冒出一句短字幕，可能是模型自己補的，建議重聽' });
+    // ② 字速異常（字／秒）
+    if (dur > 0 && chars >= 4 && chars / dur > speedThreshold)
+      reasons.push({ code: 'speed', text: `這句字太多、時間太短（每秒 ${Math.round(chars / dur)} 字），可能多出或重複了字，建議重聽` });
+    return reasons.length > 0 ? { ...s, _hallucination: true, _halluReasons: reasons } : s;
   });
+}
 
-  return flagged;
+/** r10c：可疑字幕 → 預覽待確認標記（kind:'suspect'，不寫進字幕檔） */
+function hallucinationMarks(chunks, gapThreshold = 3.0, speedThreshold = 12) {
+  const subs = detectHallucinations(chunksToSubs(chunks || []), gapThreshold, speedThreshold) || [];
+  return subs.filter((x) => x._hallucination).map((x) => ({
+    startSec: Math.max(0, x.start - 0.5), endSec: x.end, reason: x._halluReasons.map((r) => r.text).join('；'), kind: 'suspect',
+  }));
 }
 
 /** 在字幕文字前加上 ⚠ 警示標記 */
@@ -7654,13 +7622,12 @@ async function applyPostProcessing(chunks, opts = {}) {
   }
 
   // 幻覺偵測：在所有後處理完成後執行（保留最終文字狀態）
+  // r10c：只有勾選進階「匯出時在可疑字幕前加 ⚠」才改字幕文字；預設只在預覽標出（見 hallucinationMarks）
   if (cfg.hallucination) {
     subs = detectHallucinations(subs, cfg.hallucGap, cfg.hallucSpeed);
     subs = applyHallucinationWarning(subs);
     const warningCount = subs.filter(s => s._hallucination).length;
-    if (warningCount > 0) {
-      log(`⚠ 幻覺偵測：${warningCount} 段字幕標記為可疑，請人工複核`, 'warn');
-    }
+    if (warningCount > 0) log(`⚠ 已在 ${warningCount} 句可疑字幕前加上 ⚠（進階選項）`, 'warn');
   }
 
   return subsToChunks(subs);
