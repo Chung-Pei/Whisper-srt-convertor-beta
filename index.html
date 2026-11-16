@@ -4992,7 +4992,8 @@ async function prepareChunkPlan(audioOrDesc, sampleRate = SR, chunkSec = 30, str
     // 對照：舊做法每個語音段各自成一段（長段再切）
     let oldCount = 0;
     for (const sg of segs) { const d = sg.end - sg.start; oldCount += d <= chunkSec ? 1 : Math.ceil((d - strideSec) / (chunkSec - strideSec)); }
-    const speechSec = windows.reduce((a, w) => a + (w.endSec - w.startSec), 0);
+    let speechSec = 0, reach = -Infinity;   // 視窗聯集長度（接續視窗有重疊，不可直接加總）
+    for (const w of windows) { const s0 = Math.max(w.startSec, reach); if (w.endSec > s0) speechSec += w.endSec - s0; reach = Math.max(reach, w.endSec); }
     log(`✓ 相鄰的語音合併處理：共 ${windows.length} 段要辨識（不合併要 ${oldCount} 段），跳過約 ${Math.max(0, Math.round(totalSec - speechSec))} 秒的靜音`, 'ok');
   }
   return { windows, totalSec, usedVad: !!segs };
