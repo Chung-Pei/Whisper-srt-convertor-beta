@@ -5,7 +5,7 @@
 //   D-04  離線且沒下載過 base → 自測按鈕停用並說明原因
 //   D-05  未插電 → 開始時顯示提醒、不擋人，照常轉完
 //   D-06  完成後日誌有「⏱ 總計」三階段百分比加總 100；效能資訊可複製
-//   D-07  內建顯示卡（Intel UHD）＋base → 直接用 CPU，不試顯示卡；獨立顯示卡照舊先試
+//   D-07  內建顯示卡（Intel UHD）＋base → 先用 CPU，再試顯示卡實測（慢就換回 CPU／快就留在顯示卡）；獨立顯示卡照舊先試
 //   D-08  顯示卡第 1 段就比即時慢 → 第 1 段後立刻換 CPU 比較
 //   D-09  轉檔中切到別的分頁 >3 秒再回來 → 黃字提醒＋日誌
 //   D-10  （r10c 上線後覆核 S-A）換回顯示卡失敗 → 重建 CPU Worker，下一段不會卡到逾時
@@ -53,12 +53,12 @@ async function prep(page: Page, sec = 100, name = 'd.wav') {
 test.describe('r10d 純函式', () => {
   test('D-01 燈號、取樣片段、顯示卡分類、開工前檢查、階段百分比', async ({ browser }) => {
     const ctx = await newCtx(browser);
-    const p = await openWithHook(ctx, ['selfTestLight', 'selfTestSlice', 'classifyGpu', 'preflightChecks', 'perfShares', 'addPerfSeg', 'newPerfStats', 'selfTestReport'], 'new');
+    const p = await openWithHook(ctx, ['selfTestLight', 'selfTestSlice', 'classifyGpu', 'preflightChecks', 'perfShares', 'addPerfSeg', 'newPerfStats', 'selfTestReport', 'gpuEncoderDtype', 'fmtSecs'], 'new');
     const r = await p.evaluate(() => {
       const t = (window as any).__t;
       const perf = t.newPerfStats();
       t.addPerfSeg(perf, { ms: 10000, audioSec: 30, encMs: 2900, decMs: 5600 });
-      t.addPerfSeg(perf, { ms: 9000, audioSec: 30, encMs: 3000, decMs: 5000, retried: true });
+      t.addPerfSeg(perf, { ms: 9000, audioSec: 30, encMs: 3000, decMs: 5000, retried: true, mode: 'seek-retry' });
       t.addPerfSeg(perf, { ms: 0 });
       return {
         l: [0.5, 0.8, 0.81, 1.0, 1.01].map(t.selfTestLight),
@@ -70,19 +70,40 @@ test.describe('r10d 純函式', () => {
           t.classifyGpu({ vendor: 'amd', architecture: 'rdna-3', description: '' }),
           t.classifyGpu({ vendor: '', architecture: '', description: '', fallback: true }),
           t.classifyGpu(null),
+          t.classifyGpu({ vendor: 'intel', architecture: 'gen-12hp', description: '' }),
+          t.classifyGpu({ vendor: 'intel', architecture: 'xe-2hpg', description: '' }),
+          t.classifyGpu({ vendor: 'intel', architecture: 'xe-lpg', description: '' }),
+          t.classifyGpu({ vendor: 'intel', architecture: 'gen-9', description: '' }),
+          t.classifyGpu({ vendor: 'qualcomm', architecture: '', description: '' }),
+          t.classifyGpu({ vendor: 'amd', architecture: 'rdna-3', description: 'charming' }),
         ],
+        enc: [
+          t.gpuEncoderDtype('striimit/whisper-large-v3-turbo-webgpu', 'high', 8),
+          t.gpuEncoderDtype('onnx-community/whisper-large-v3-turbo', 'high', 8),
+          t.gpuEncoderDtype('onnx-community/whisper-large-v3-turbo', 'mid', 4),
+          t.gpuEncoderDtype('onnx-community/whisper-large-v3-turbo', 'low', 8),
+          t.gpuEncoderDtype('onnx-community/whisper-large-v3-turbo', 'high', null),
+          t.gpuEncoderDtype('Xenova/whisper-base', 'high', 8),
+        ],
+        fs: [t.fmtSecs(119.6), t.fmtSecs(59.7), t.fmtSecs(75)],
+        ok: t.selfTestReport({ rtf: 0.4, isolated: true, threads: 6, hc: 8, power: '插電', gpu: 'none' }).causes.map((c: any) => c.key),
+        ut: t.selfTestReport({ rtf: 0.9, isolated: true, threads: 1, hc: 8, power: '不明', gpu: 'none', userThreads: 1 }).causes.map((c: any) => c.key),
         pf: [
           t.preflightChecks({ threads: 1, hc: 8, power: '未插電', isIOS: false }).map((x: any) => x.key),
           t.preflightChecks({ threads: 6, hc: 12, power: '插電', isIOS: false }).length,
           t.preflightChecks({ threads: 1, hc: 1, power: '不明', isIOS: false }).length,
         ],
         sh: t.perfShares(perf), segs: perf.segs, retries: perf.retries,
-        rep: t.selfTestReport({ rtf: 1.3, isolated: false, threads: 1, hc: 8, power: '未插電', gpu: 'integrated' }),
+        rep: t.selfTestReport({ rtf: 1.3, isolated: false, threads: 1, hc: 8, power: '未插電', gpu: 'slower' }),
       };
     });
     expect(r.l).toEqual(['green', 'green', 'yellow', 'yellow', 'red']);
     expect(r.s).toEqual([{ from: 60, len: 60 }, { from: 30, len: 60 }, { from: 0, len: 40 }]);
-    expect(r.g).toEqual(['integrated', 'discrete', 'discrete', 'unknown', 'integrated', 'unknown']);
+    expect(r.g).toEqual(['integrated', 'discrete', 'discrete', 'unknown', 'integrated', 'unknown', 'discrete', 'discrete', 'unknown', 'integrated', 'integrated', 'unknown']);
+    expect(r.enc).toEqual(['fp16', 'fp32', 'fp16', 'fp16', 'fp16', null]);   // 覆核 M1／M3
+    expect(r.fs).toEqual(['2 分', '1 分', '1 分 15 秒']);   // 覆核 S4
+    expect(r.ok).toEqual(['ok-threads', 'ok-power']);       // 覆核 S9
+    expect(r.ut).toEqual(['user-threads']);                 // 覆核 S5
     expect(r.pf).toEqual([['threads', 'power'], 0, 0]);
     expect(r.sh.reduce((a: number, b: number) => a + b, 0)).toBe(100);
     expect(r.segs).toBe(2); expect(r.retries).toBe(1);
@@ -151,6 +172,40 @@ test.describe('r10d 一鍵自測', () => {
     await expect(page.locator('#selfTestTitle')).toContainText('切到別的頁面');
     await expect(page.locator('#btnSelfTest')).toHaveAttribute('data-state', 'idle');
     await ctx.close();
+  });
+
+  test('D-12 自測也比顯示卡：同樣 30 秒段、暖機不算、只有完整比較才記住；比較中切背景不記（覆核 M2）', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await mockEnv(page, { gpu: { vendor: 'intel', architecture: 'gen-12lp', description: '' } });   // 內建顯示卡也要比
+    await installScriptedWorker(page, { segments: SEGS, backend: 'webgpu', rules: [{ segIdx: 0, stats: st(12000) }, { segIdx: 1, stats: st(12000) }, { segIdx: 10, stats: st(20000) }, { segIdx: 11, stats: st(6000) }] });
+    await page.goto(BASE_URL);
+    await page.locator('#fileInput').setInputFiles({ name: 'g.wav', mimeType: 'audio/wav', buffer: wav(130) });
+    await page.locator('#btnSelfTest').click();
+    await expect(page.locator('#selfTestResult')).toBeVisible({ timeout: 60_000 });
+    const runs = await page.evaluate(() => (window as any).__workerLog.filter((x: any) => x.type === 'RUN_CHUNK').map((x: any) => x.segIdx));
+    expect(runs).toEqual([0, 1, 10, 11]);
+    expect(await loadsOf(page)).toEqual([false, true]);
+    const pick = await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']);
+    expect(pick.pick).toBe('webgpu'); expect(pick.by).toBe('selftest');
+    await expect(page.locator('#selfTestCauses li[data-cause="ok-gpu"]')).toHaveCount(1);
+    await ctx.close();
+
+    const ctx2 = await newCtx(browser); const p2 = await ctx2.newPage();
+    await mockEnv(p2, { gpu: 'empty' });
+    await installScriptedWorker(p2, { segments: SEGS, backend: 'webgpu', rules: [{ segIdx: 0, stats: st(12000) }, { segIdx: 1, stats: st(12000) }, { segIdx: 10, stats: st(6000), delay: 1500 }, { segIdx: 11, stats: st(6000) }] });
+    await p2.goto(BASE_URL);
+    await p2.locator('#fileInput').setInputFiles({ name: 'g2.wav', mimeType: 'audio/wav', buffer: wav(130) });
+    await p2.locator('#btnSelfTest').click();
+    await p2.waitForFunction(() => (window as any).__workerLog.some((x: any) => x.type === 'RUN_CHUNK' && x.segIdx === 10));
+    await p2.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      setTimeout(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' }); document.dispatchEvent(new Event('visibilitychange')); }, 200);
+    });
+    await expect(p2.locator('#selfTestResult')).toHaveAttribute('data-state', 'invalid-bg', { timeout: 30_000 });
+    expect(await p2.evaluate(() => localStorage.getItem('whisper-backend-pick'))).toBeNull();
+    await ctx2.close();
   });
 
   test('D-04 離線且沒下載過 base → 自測停用並說明', async ({ browser }) => {
@@ -238,20 +293,33 @@ test.describe('r10d 顯示卡選擇', () => {
     await page.locator('#startBtn').click();
     await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
   }
-  test('D-07 內建顯示卡＋base → 直接 CPU；獨立顯示卡照舊先試', async ({ browser }) => {
+  test('D-07 內建顯示卡＋base → 先 CPU，再實測顯示卡（慢→回 CPU）；獨立顯示卡照舊先試', async ({ browser }) => {
     test.setTimeout(120_000);
     const ctx = await newCtx(browser); const page = await ctx.newPage();
-    await run(page, { vendor: 'intel', architecture: 'gen-12lp', description: '' }, [0, 1, 2, 3].map((i) => ({ segIdx: i, stats: st(3000) })));
-    expect(await loadsOf(page)).toEqual([false]);
+    // CPU 第 1 段 0.1、顯示卡暖機段 1.5（>1 倍即時且 >2 倍 CPU）→ 立刻回 CPU 並記住
+    await run(page, { vendor: 'intel', architecture: 'gen-12lp', description: '' }, [{ segIdx: 0, stats: st(3000) }, { segIdx: 1, stats: st(45000) }, { segIdx: 2, stats: st(3000) }, { segIdx: 3, stats: st(3000) }]);
+    expect(await loadsOf(page)).toEqual([false, true, false]);
     const log = await page.locator('#logBox').innerText();
     expect(log).toContain('只有內建顯示卡');
-    expect(log).not.toContain('正在比較');
+    expect(log).toContain('這台電腦用 CPU 比較快');
+    expect(await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']?.pick)).toBe('wasm');
     expectComplete(await downloadText(page));
     const ctx2 = await newCtx(browser); const p2 = await ctx2.newPage();
     await run(p2, { vendor: 'nvidia', architecture: 'ampere', description: '' }, [0, 1, 2, 3].map((i) => ({ segIdx: i, stats: st(3000) })));
     expect((await loadsOf(p2))[0]).toBe(true);
     expect(await p2.locator('#logBox').innerText()).not.toContain('只有內建顯示卡');
     await ctx.close(); await ctx2.close();
+  });
+
+  test('D-07b 內建顯示卡但顯示卡較快 → 改用顯示卡並記住（自動偵測，不寫死）', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await run(page, { vendor: 'intel', architecture: 'gen-12lp', description: '' }, [{ segIdx: 0, stats: st(9000) }, { segIdx: 1, stats: st(6000) }, { segIdx: 2, stats: st(3000) }, { segIdx: 3, stats: st(3000) }]);
+    expect(await loadsOf(page)).toEqual([false, true]);
+    expect(await page.locator('#logBox').innerText()).toContain('這台電腦用顯示卡比較快');
+    expect(await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']?.pick)).toBe('webgpu');
+    expectComplete(await downloadText(page));
+    await ctx.close();
   });
 
   test('D-08 顯示卡第 1 段就比即時慢 → 第 1 段後立刻換 CPU', async ({ browser }) => {

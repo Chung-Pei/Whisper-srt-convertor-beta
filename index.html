@@ -1455,7 +1455,7 @@
   <div class="section-title">語音模型</div>
   <!-- r10d：一鍵測試這台電腦 -->
   <div class="selftest-row">
-    <button class="btn-diag" id="btnSelfTest" type="button" data-state="idle">🩺 測試這台電腦（約 30 秒）</button>
+    <button class="btn-diag" id="btnSelfTest" type="button" data-state="idle">🩺 測試這台電腦（約 1–2 分鐘）</button>
     <span class="selftest-hint" id="selfTestHint" role="status" aria-live="polite"></span>
   </div>
   <div class="selftest-prompt" id="selfTestPrompt" data-state="dismissed">
@@ -1957,9 +1957,11 @@ async function acquireWakeLock() {
   try {
     _wakeLock = await navigator.wakeLock.request('screen');
     log('🔒 螢幕常亮已啟用（Wake Lock）', 'ok');
+    try { refreshKeepAwakeNote(); } catch (_) {}
     // 系統強制釋放時（iOS 鎖定、低電量等）同步清除參照
     _wakeLock.addEventListener('release', () => {
       _wakeLock = null;
+      try { refreshKeepAwakeNote(); } catch (_) {}
     });
   } catch (err) {
     // 常見原因：iOS 鎖定中、低電量模式、非 Secure Context
@@ -2949,12 +2951,18 @@ self.addEventListener('message', async (e) => {
           if (isOnnxCommunity) {
             // 分離 ONNX：decoder 用 q4 壓縮記憶體。r10d：encoder 改 fp32——fp16 encoder 在部分顯示卡（含 Intel 內顯）
             // 會輸出錯字或重複（transformers.js #1590），代價是 encoder 權重約大一倍
-            dtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
+            // r10d 覆核 M1／M3：精度由主執行緒依模型與記憶體決定（striimit 只有 fp16；記憶體不足用 fp16）
+            dtype = { encoder_model: payload.gpuEncDtype || 'fp16', decoder_model_merged: 'q4' };
           } else {
             // 單一 ONNX (Xenova)：WebGPU 預設 fp32，記憶體充足時效果最佳
             dtype = 'fp32';
           }
           // r9：離線且顯示卡模式需要的權重不在本機 → 不建 GPU session，直接改用本機已有的一般模式權重
+          // r10d 覆核 M3：離線時 fp32 encoder 不在本機但 fp16 在（之前版本下載的）→ 改用 fp16，不要退回 CPU
+          if (_isOffline() && isOnnxCommunity && dtype.encoder_model === 'fp32' && (await _missingWeights(payload.modelId, dtype)).length > 0) {
+            const alt = { encoder_model: 'fp16', decoder_model_merged: 'q4' };
+            if ((await _missingWeights(payload.modelId, alt)).length === 0) dtype = alt;
+          }
           if (_isOffline() && (await _missingWeights(payload.modelId, dtype)).length > 0) {
             const wd = await _pickOfflineDtype(payload.modelId, payload.dtype);
             if (!wd) throw _weightsMissingError(payload.modelId, payload.dtype, 'gpu');
@@ -3740,7 +3748,8 @@ function writeBackendPick(modelId, rec) {
 }
 // ── r10d：內建顯示卡偵測 ─────────────────────────────────────────────
 // 使用者真機（Intel UHD 內顯、6 核）：base 用顯示卡每 1 分鐘音訊約 154 秒，CPU 約 15 秒（快 10 倍）。
-// 所以內建顯示卡＋base／small 直接用 CPU，不再先在顯示卡上試跑浪費幾分鐘；獨立顯示卡或判斷不出來的照舊自動比較。
+// 所以內建顯示卡＋base／small 先用 CPU 開始；但這只是預設（別台內顯可能顯示卡較快），之後會再試一小段顯示卡實測比較並記住。
+// 獨立顯示卡或判斷不出來的照舊先試顯示卡。
 let _gpuKind = null;   // 'integrated'｜'discrete'｜'unknown'｜'none'
 let _gpuInfo = null;
 let _gpuProbeP = null;
@@ -3751,8 +3760,13 @@ function classifyGpu(info) {
   const v = String(info.vendor || '').toLowerCase();
   const d = (String(info.architecture || '') + ' ' + String(info.description || '')).toLowerCase();
   if (/nvidia/.test(v) || /nvidia|geforce|rtx|quadro/.test(d)) return 'discrete';
-  if (/intel/.test(v) || /intel/.test(d)) return /\barc\b|xe-hpg|alchemist|battlemage/.test(d) ? 'discrete' : 'integrated';
-  if (/qualcomm|arm|imagination|mali|adreno|powervr/.test(v + ' ' + d)) return 'integrated';
+  if (/intel/.test(v) || /intel/.test(d)) {
+    // r10d 覆核 S1：Chrome 回報 gen-9／gen-12lp／gen-12hp／xe-lpg／xe-2lpg／xe-2hpg…；Arc 獨顯多為 gen-12hp 或 *hpg
+    if (/\barc\b|12hp|hpg|alchemist|battlemage/.test(d)) return 'discrete';
+    if (/xe-?2?-?lpg|lunar|meteor/.test(d)) return 'unknown';   // 新款較強的內顯：交給實測
+    return 'integrated';
+  }
+  if (/qualcomm|\barm\b|imagination|mali|adreno|powervr/.test(v + ' ' + d)) return 'integrated';
   return 'unknown';   // AMD、Apple 等：內顯獨顯都有，交給自動比較
 }
 function probeGpuKind() {
@@ -3773,7 +3787,7 @@ function probeGpuKind() {
   return _gpuProbeP;
 }
 const _isCpuSizedModel = (modelId) => /whisper-(base|small)\b/i.test(String(modelId));
-/** 這台是內建顯示卡、模型是 base／small、而且沒有「顯示卡比較快」的實測紀錄 → 直接用 CPU */
+/** 這台是內建顯示卡、模型是 base／small、而且沒有「顯示卡比較快」的實測紀錄 → 先用 CPU（之後會實測比較） */
 function integratedGpuPrefersCpu(modelId) {
   if (_gpuKind !== 'integrated' || !_isCpuSizedModel(modelId)) return false;
   const pick = readBackendPick(modelId);
@@ -3781,7 +3795,6 @@ function integratedGpuPrefersCpu(modelId) {
 }
 
 function backendTrialEligible(modelId) {
-  if (integratedGpuPrefersCpu(modelId)) return false;
   return isWebGPUSupported() && !_gpuFailedModels.has(modelId) && /whisper-(base|small)\b/i.test(String(modelId)) && !readBackendPick(modelId);
 }
 /** 換後端重載（試用與挑選結果共用）；終止舊 Worker，釋放記憶體 */
@@ -3807,11 +3820,20 @@ function trialRate(st) {
   return st.ms / 1000 / st.audioSec;
 }
 
+/** r10d 覆核 M1／M3：顯示卡模式的 encoder 精度。striimit 相容版只有 fp16 檔；onnx-community 的 fp32 encoder 約 2.5 GB，
+ *  只在記憶體夠的電腦（deviceMemory ≥ 8 且不是低記憶體）用 fp32（避開 #1590 錯字），其他用 fp16。Xenova 單檔模型回 null。 */
+function gpuEncoderDtype(modelId, tier = detectMemoryTier().tier, devMem = (typeof navigator !== 'undefined' ? navigator.deviceMemory : undefined)) {
+  const m = String(modelId);
+  if (m.startsWith('striimit/')) return 'fp16';
+  if (!m.startsWith('onnx-community/')) return null;
+  return tier !== 'low' && devMem >= 8 ? 'fp32' : 'fp16';
+}
+
 function defaultPreferGpu(modelId) {
   if (!isWebGPUSupported() || _gpuFailedModels.has(modelId)) return false;
   const pick = readBackendPick(modelId);
   if (pick && pick.pick === 'wasm') return false;   // r10c：這台電腦試過，CPU 比較快
-  if (integratedGpuPrefersCpu(modelId)) return false;   // r10d：內建顯示卡＋base／small → CPU
+  if (integratedGpuPrefersCpu(modelId)) return false;   // r10d：內建顯示卡＋base／small → 先用 CPU，稍後實測比較
   const big = /whisper-(medium|large)/i.test(String(modelId));
   return !(big && detectMemoryTier().tier === 'low');
 }
@@ -3821,6 +3843,7 @@ function buildLoadModelPayload(modelId, dtype, opts = {}) {
     modelId,
     dtype,
     preferGpu: opts.preferGpu ?? defaultPreferGpu(modelId),
+    gpuEncDtype: gpuEncoderDtype(modelId),
     modelFolderHandle: modelFolderHandle ?? null,
     bypassFolder: !!opts.bypassFolder,
     afterGpuFail: !!opts.afterGpuFail,
@@ -4349,7 +4372,8 @@ document.querySelectorAll('.model-btn').forEach(btn => {
     // WebGPU 時顯示 per-module dtype 預期值；載入後 BACKEND message 更新為實際值
     const isOnnxCommunity = selectedModel.startsWith('onnx-community/') || selectedModel.startsWith('striimit/');
     if (hasGpu) {
-      const dtypeStr = isOnnxCommunity ? 'enc:fp32 / dec:q4' : 'fp32';
+      const encD = gpuEncoderDtype(selectedModel);
+      const dtypeStr = isOnnxCommunity ? `enc:${encD} / dec:q4${encD === 'fp32' ? '（顯示卡模式首次約 2.7 GB）' : ''}` : 'fp32';
       hint.textContent = `⚙ 量化：${dtypeStr} ／ 後端：⚡ WebGPU（載入中更新）`;
     } else {
       hint.textContent = `⚙ 量化：查詢中… ／ 後端：⚪ WASM`;
@@ -5996,7 +6020,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     if (!workerReady || loadedModel !== selectedModel) {
       await probeGpuKind();
       if (integratedGpuPrefersCpu(selectedModel))
-        log('🖥 這台電腦只有內建顯示卡：這個模型直接用 CPU（多核心）辨識，通常比內建顯示卡快很多。', 'info');
+        log('🖥 這台電腦只有內建顯示卡：先用 CPU（多核心）辨識，通常比較快；第一次會再試一小段顯示卡，自動選快的並記住。', 'info');
       log(`載入模型：${selectedModel}（首次需下載）`, 'info');
       setProgress(0, '下載/載入模型...', true);
 
@@ -6104,7 +6128,12 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
 
     let nextSegPromise = gen.next();
     // r10c (b)：顯示卡 vs CPU 自動試用（至少要還有 4 段才值得比）
-    let _trial = (_lastBackend === 'webgpu' && backendTrialEligible(runModel) && windows.length - i >= 4) ? { stage: 'gpu', gpuSeen: 0, gpuRate: null } : null;
+    // r10d（使用者 11-17「自動偵測」）：內建顯示卡只是預設 → 先用 CPU 量 1 段，再試顯示卡實測，選快的並記住
+    let _trial = null;
+    if (backendTrialEligible(runModel) && windows.length - i >= 4) {
+      if (_lastBackend === 'webgpu') _trial = { stage: 'gpu', gpuSeen: 0, gpuRate: null };
+      else if (_gpuKind === 'integrated' && integratedGpuPrefersCpu(runModel)) _trial = { stage: 'cpuFirst', gpuSeen: 0, gpuRate: null, cpuRate: null };
+    }
 
     const _resumeStartedAt = Date.now();
     let _resumeSavedIdx = i;
@@ -6302,12 +6331,53 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       // ── r10c (b)：顯示卡 vs CPU 自動試用（只在第一次用這個模型時）
       if (_trial && !isCancelled) {
         const rate = trialRate(st);
-        if (_trial.stage === 'gpu' && _lastBackend === 'webgpu') {
+        const perMinI = (r) => Math.max(1, Math.round(r * 60));
+        if (_trial.stage === 'cpuFirst') {
+          if (rate == null || _lastBackend === 'webgpu') { if (_lastBackend === 'webgpu') _trial = null; }
+          else if (i < windows.length - 1) {
+            _trial.cpuRate = rate;
+            log('🧪 第一次用這個模型：試一小段顯示卡，看看這台電腦哪個比較快（只比一次，字幕照常產生）…', 'info');
+            try { worker = await switchWorkerBackend(runModel, true); _trial.stage = _lastBackend === 'webgpu' ? 'gpuAfter' : null; if (!_trial.stage) _trial = null; }
+            catch (e) {
+              if (e?.message === 'CANCELLED') throw e;
+              log('（顯示卡模式載入不了，繼續用 CPU）', 'info');
+              _gpuFailedModels.add(runModel);
+              worker = await switchWorkerBackend(runModel, false); _trial = null;
+            }
+          } else _trial = null;
+        } else if (_trial.stage === 'gpuAfter') {
+          const c = _trial.cpuRate;
+          const backToCpu = async () => {
+            try { worker = await switchWorkerBackend(runModel, false); }
+            catch (e) { if (e?.message === 'CANCELLED') throw e; log('（換回 CPU 失敗，這次繼續用顯示卡）', 'info'); }
+          };
+          if (_lastBackend !== 'webgpu') { _trial = null; }   // 顯示卡出錯已退回 CPU
+          else if (rate == null) { /* 這段不準（鬼打牆／重試／太短），等下一段 */ if (i >= windows.length) _trial = null; }
+          else {
+            _trial.gpuSeen++;
+            // 第 1 段含暖機：明顯比 CPU 慢（>1 倍即時且 >2 倍 CPU）就不用再等，換回 CPU 並記住
+            if (_trial.gpuSeen === 1 && rate > 1.0 && rate > c * 2) {
+              writeBackendPick(runModel, { pick: 'wasm', gpuRate: rate, cpuRate: c });
+              log(`✓ 比較結果：這台電腦用 CPU 比較快（每 1 分鐘音訊：CPU 約 ${perMinI(c)} 秒、顯示卡約 ${perMinI(rate)} 秒），接下來都用 CPU。`, 'ok');
+              _trial = null; await backToCpu();
+            } else if (_trial.gpuSeen >= 2) {
+              if (rate < c) {
+                writeBackendPick(runModel, { pick: 'webgpu', gpuRate: rate, cpuRate: c });
+                log(`✓ 比較結果：這台電腦用顯示卡比較快（每 1 分鐘音訊：顯示卡約 ${perMinI(rate)} 秒、CPU 約 ${perMinI(c)} 秒），接下來都用顯示卡。`, 'ok');
+              } else {
+                writeBackendPick(runModel, { pick: 'wasm', gpuRate: rate, cpuRate: c });
+                log(`✓ 比較結果：這台電腦用 CPU 比較快（每 1 分鐘音訊：CPU 約 ${perMinI(c)} 秒、顯示卡約 ${perMinI(rate)} 秒），接下來都用 CPU。`, 'ok');
+                await backToCpu();
+              }
+              _trial = null;
+            }
+          }
+        } else if (_trial.stage === 'gpu' && _lastBackend === 'webgpu') {
           _trial.gpuSeen++;
           // 第 1 段是顯示卡暖機（編譯著色器），通常不算；r10d：但第 1 段就比錄音本身還慢（每秒音訊 >1 秒）→ 不用再等，立刻換 CPU 比
           const slowFirst = _trial.gpuSeen === 1 && rate != null && rate > 1.0;
           if ((_trial.gpuSeen >= 2 || slowFirst) && rate != null) {
-            _trial.gpuRate = rate;
+            _trial.gpuRate = rate; _trial.warmup = _trial.gpuSeen === 1;
             if (i < windows.length) {
               log('🧪 第一次用這個模型：正在比較顯示卡和 CPU 哪個比較快（只比一次，字幕照常產生）…', 'info');
               try { worker = await switchWorkerBackend(runModel, false); _trial.stage = 'cpu'; }
@@ -6329,7 +6399,10 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         } else if (_trial.stage === 'cpu' && rate != null) {
           const g = _trial.gpuRate, c = rate;
           const perMin = (r) => Math.max(1, Math.round(r * 60));
-          if (c < g) {
+          if (c < g && _trial.warmup && !(c < g * 0.6)) {
+            // r10d 覆核 S2：顯示卡那段含暖機（編譯），CPU 又沒有明顯較快 → 這次用 CPU，但不記住，下次再比
+            log(`✓ 比較結果：這次先用 CPU（每 1 分鐘音訊：CPU 約 ${perMin(c)} 秒、顯示卡暖機時約 ${perMin(g)} 秒），下次會再比一次。`, 'ok');
+          } else if (c < g) {
             writeBackendPick(runModel, { pick: 'wasm', gpuRate: g, cpuRate: c });
             log(`✓ 比較結果：這台電腦用 CPU 比較快（每 1 分鐘音訊：CPU 約 ${perMin(c)} 秒、顯示卡約 ${perMin(g)} 秒），接下來都用 CPU。`, 'ok');
           } else {
@@ -6595,14 +6668,14 @@ function addPerfSeg(perf, st, fallbackAudioSec) {
   perf.ms += st.ms;
   const enc = Number(st.encMs) || 0, dec = Number(st.decMs) || 0;
   perf.encMs += enc; perf.decMs += dec; perf.otherMs += Math.max(0, st.ms - enc - dec);
-  if (st.retried) perf.retries++;
-  if (st.mode === 'seek-retry') perf.retries++;
+  if (st.retried || st.mode === 'seek-retry') perf.retries++;   // r10d 覆核 S10：同一段只算一次
   return perf;
 }
 function fmtSecs(sec) {
   sec = Math.max(0, sec);
-  if (sec < 60) return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)} 秒`;
-  const m = Math.floor(sec / 60), ss = Math.round(sec % 60);
+  if (sec < 59.5) return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)} 秒`;
+  const tot = Math.round(sec);   // r10d 覆核 S4：先四捨五入總秒數，避免「1 分 60 秒」
+  const m = Math.floor(tot / 60), ss = tot % 60;
   if (m < 60) return ss ? `${m} 分 ${ss} 秒` : `${m} 分`;
   return `${Math.floor(m / 60)} 時 ${String(m % 60).padStart(2, '0')} 分`;
 }
@@ -6621,7 +6694,7 @@ function currentThreadsText() {
 }
 function formatPerfSummary(perf) {
   const [e, d, o] = perfShares(perf);
-  const wall = (performance.now() - perf.wallStart) / 1000 + perf.loadMs / 1000;
+  const wall = (performance.now() - perf.wallStart) / 1000;   // r10d 覆核 S3：wallStart 已含載入，不再重複加
   const be = perf.backend === 'webgpu' ? '顯示卡' : 'CPU';
   return `⏱ 總計 ${fmtSecs(wall)}：載入模型 ${fmtSecs(perf.loadMs / 1000)}｜聽音訊 ${fmtSecs(perf.encMs / 1000)}（${e}%）｜寫字 ${fmtSecs(perf.decMs / 1000)}（${d}%）｜整理字幕 ${fmtSecs(perf.otherMs / 1000)}（${o}%）｜重試 ${perf.retries} 次｜補聽接縫 ${perf.gapFills} 次｜${be}・${currentThreadsText()}`;
 }
@@ -6698,10 +6771,19 @@ document.getElementById('btnPreflightOk')?.addEventListener('click', () => {
 });
 
 // ── 轉檔中常駐提醒＋背景分頁提醒
+// r10d 覆核 S6：依實際是否取得螢幕常亮來寫，不只看瀏覽器支不支援
+function keepAwakeText() {
+  return '🔌 請接上電源・不要切換分頁或關螢幕' + (_wakeLock ? '（已讓螢幕保持亮著）'
+    : 'wakeLock' in navigator ? '（螢幕可能會自動關閉，請調整電源設定）' : '（這個瀏覽器無法自動保持螢幕亮著，請調整電源設定）');
+}
+function refreshKeepAwakeNote() {
+  const k = document.getElementById('keepAwakeNote');
+  if (k && k.dataset.state === 'shown') k.textContent = keepAwakeText();
+}
 function setRunNotes(on) {
   const k = document.getElementById('keepAwakeNote'), b = document.getElementById('bgWarn');
   if (k) {
-    k.textContent = '🔌 請接上電源・不要切換分頁或關螢幕' + ('wakeLock' in navigator ? '（已讓螢幕保持亮著）' : '（這個瀏覽器無法自動保持螢幕亮著，請調整電源設定）');
+    k.textContent = keepAwakeText();
     k.classList.toggle('show', !!on); k.dataset.state = on ? 'shown' : 'hidden';
   }
   if (b && !on) { b.classList.remove('show'); b.dataset.state = 'hidden'; }
@@ -6712,7 +6794,7 @@ const BG_WARN_MIN_MS = 3000;   // 切走不到 3 秒（例如看一下通知）�
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     if (_selfTest.running) _selfTest.invalid = true;
-    if (isRunning && !_pauseResolve) _hiddenAt = Date.now();
+    if (isRunning && !_pauseResolve && !_selfTest.running) _hiddenAt = Date.now();   // 自測有自己的作廢處理
     return;
   }
   if (!_hiddenAt) return;
@@ -6743,16 +6825,19 @@ function selfTestReport(r) {
   const lo = Math.max(1, Math.round(50 * r.rtf)), hi = Math.max(lo + 2, Math.round(50 * r.rtf * 1.3));
   const summary = `50 分鐘的課約需 ${lo}–${hi} 分鐘（目前 ${(1 / r.rtf).toFixed(1)} 倍速，${r.backend === 'webgpu' ? '用顯示卡' : '用 CPU'}）`;
   const causes = [];
-  if (!r.isolated || (r.threads <= 1 && r.hc > 1)) causes.push({ key: 'no-isolation', text: r.isSafari
+  if (r.isolated && r.userThreads === 1 && r.threads <= 1) causes.push({ key: 'user-threads', text: '你在進階設定把運算線路選成 1 條；改回「自動」通常會快很多。' });
+  else if (!r.isolated || (r.threads <= 1 && r.hc > 1 && !(r.userThreads > 0))) causes.push({ key: 'no-isolation', text: r.isSafari
     ? '⚠ 只用到 1 條運算線路：Safari 只能用單線路，建議改用 Chrome 或 Edge。'
     : '⚠ 只用到 1 條運算線路，這是變慢最常見的原因。請關掉這個分頁重新開一次；仍不行請改用 Chrome 或 Edge。' });
   if (r.power === '未插電') causes.push({ key: 'on-battery', text: '⚠ 沒有接電源，電腦可能自動降速。請接上電源，Windows 電源模式選「最佳效能」。' });
   if (r.gpu === 'failed') causes.push({ key: 'gpu-failed', text: '顯示卡加速無法使用，已自動用一般模式（CPU），不需處理。' });
-  else if (r.gpu === 'slower' || r.gpu === 'integrated') causes.push({ key: 'gpu-slower', text: r.gpu === 'integrated'
-    ? '這台電腦是內建顯示卡，用 CPU 比較快，已自動改用，不需處理。'
-    : `顯示卡比 CPU 慢${r.gpuRate ? `（約 ${(1 / r.gpuRate).toFixed(1)} 倍速）` : ''}，已自動用一般模式（CPU），不需處理。` });
+  else if (r.gpu === 'slower') causes.push({ key: 'gpu-slower', text: `顯示卡比 CPU 慢${r.gpuRate ? `（約 ${(1 / r.gpuRate).toFixed(1)} 倍速）` : ''}，已自動用一般模式（CPU），不需處理。` });
   if (light === 'yellow' && causes.length === 0) causes.push({ key: 'tip', text: '可以晚上開著電腦放著跑（請接電源）。' });
   if (light === 'red' && causes.length === 0) causes.push({ key: 'tip', text: '這台電腦本身較慢：請關掉其他程式、接上電源後再測一次；長的課可以晚上放著跑。' });
+  // r10d 覆核 S9：沒問題的項目也列 1–2 行，看得出測了什麼
+  if (causes.length < 3 && r.isolated && r.threads > 1) causes.push({ key: 'ok-threads', text: `✓ 多核心運算：已啟用（${r.threads} 條）` });
+  if (causes.length < 3 && r.power === '插電') causes.push({ key: 'ok-power', text: '✓ 電源：已接上' });
+  if (causes.length < 3 && r.gpu === 'faster') causes.push({ key: 'ok-gpu', text: '✓ 顯示卡比 CPU 快，已自動改用顯示卡' });
   return { light, title, summary, causes: causes.slice(0, 3) };
 }
 function selfTestCopyText(r) {
@@ -6768,7 +6853,7 @@ function setSelfTestBtn(state, text) {
   const b = document.getElementById('btnSelfTest'); if (!b) return;
   b.dataset.state = state;
   b.disabled = state === 'running' || state === 'downloading' || state === 'disabled-offline';
-  b.textContent = text || (state === 'idle' ? '🩺 測試這台電腦（約 30 秒）' : state === 'disabled-offline' ? '🩺 測試這台電腦（需要網路）' : b.textContent);
+  b.textContent = text || (state === 'idle' ? '🩺 測試這台電腦（約 1–2 分鐘）' : state === 'disabled-offline' ? '🩺 測試這台電腦（需要網路）' : b.textContent);
 }
 function showSelfTestResult(r) {
   const card = document.getElementById('selfTestResult'); if (!card) return;
@@ -6805,8 +6890,9 @@ function maybeShowSelfTestPrompt() {
   pr.classList.toggle('show', show); pr.dataset.state = show ? 'shown' : 'dismissed';
 }
 async function runSelfTest() {
-  if (_selfTest.running || isRunning) return;
   const hint = document.getElementById('selfTestHint');
+  if (_selfTest.running) return;
+  if (isRunning) { flashHint(hint, '正在轉檔中，轉完（或停止）後再測試。'); return; }
   const item = batchQueue.find((x) => x.status === 'pending') || batchQueue[0];
   const file = item ? item.file : null;
   if (!file) { flashHint(hint, '請先在下方選一個錄音檔，會拿其中 1 分鐘來測（不會存任何資料）。'); return; }
@@ -6838,7 +6924,7 @@ async function runSelfTest() {
       if (t === 'PROGRESS' && x.status === 'downloading' && x.total) setSelfTestBtn('downloading', `下載模型 ${Math.round(x.loaded / x.total * 100)}%（只需一次）`);
       if (t === 'PROGRESS' && x.status !== 'downloading' && document.getElementById('btnSelfTest').dataset.state === 'downloading') setSelfTestBtn('running', '測試中…');
     };
-    const runOn = async (gpu, data, segBase, timeoutMs, pieceSec = 30) => {
+    const runOn = async (gpu, data, segBase, timeoutMs, pieceSec = 30, stopAfter = null) => {
       w = createWorker(); workerReady = false; loadedModel = null;
       w.addEventListener('message', onMsg);
       const dtype = await chooseDtype(SELFTEST_MODEL);
@@ -6858,6 +6944,8 @@ async function runSelfTest() {
         acc.ms += ms; acc.audioSec += a; acc.encMs += st.encMs || 0; acc.decMs += st.decMs || 0;
         acc.otherMs += Math.max(0, ms - (st.encMs || 0) - (st.decMs || 0));
         if (st.retried || st.mode === 'seek-retry') acc.retries++;
+        if (stopAfter && stopAfter(acc)) { acc.stopped = true; break; }
+        if (_selfTest.invalid) break;
       }
       return acc;
     };
@@ -6865,29 +6953,36 @@ async function runSelfTest() {
     const cpu = await runOn(false, clip, 0, 120000);
     if (_selfTest.invalid) { showSelfTestInvalid(); return; }
     const cpuRate = cpu.ms / 1000 / cpu.audioSec;
-    // 2) 顯示卡（獨立或判斷不出的才比；內建顯示卡已知較慢，不浪費時間）：15 秒暖機＋15 秒量測
-    let gpu = isWebGPUSupported() && _gpuKind !== 'none' && !_gpuFailedModels.has(SELFTEST_MODEL) ? (_gpuKind === 'integrated' ? 'integrated' : 'pending') : 'none';
-    let gpuRate = null, gpuAcc = null;
+    // 2) 顯示卡（r10d 覆核 M2＋使用者「自動偵測」：所有能用顯示卡的電腦都比，內建顯示卡也比）
+    //    與 CPU 同樣用 30 秒段：第 1 段暖機（編譯）不算，第 2 段與 CPU 的第 2 段（同一段音訊）比較
+    let gpu = isWebGPUSupported() && _gpuKind !== 'none' && !_gpuFailedModels.has(SELFTEST_MODEL) ? 'pending' : 'none';
+    let gpuRate = null, gpuAcc = null, cmpCpuRate = cpuRate;
     if (gpu === 'pending') {
       try {
-        const g = await runOn(true, clip.subarray(0, Math.min(clip.length, 30 * SR)), 10, 90000, 15);
+        const segRate = (x) => x && x.audioSec > 0 ? x.ms / 1000 / x.audioSec : null;
+        // 暖機段就慢到 >1 倍即時且 >2 倍 CPU → 不用再等第 2 段
+        const g = await runOn(true, clip, 10, 180000, 30, (a) => a.segs.length === 1 && segRate(a.segs[0]) > Math.max(1.0, cpuRate * 2));
         if (g.backend !== 'webgpu') gpu = 'failed';
-        else {
-          const last = g.segs[g.segs.length - 1];   // 第 1 段是暖機
-          gpuRate = last && last.audioSec > 0 ? last.ms / 1000 / last.audioSec : null;
-          gpu = gpuRate != null && gpuRate < cpuRate ? 'faster' : 'slower';
+        else if (_selfTest.invalid) gpu = 'unknown';
+        else if (g.stopped) { gpuRate = segRate(g.segs[0]); gpu = 'slower'; gpuAcc = g; }
+        else if (g.segs.length >= 2 && g.segs[1].audioSec >= 10 && cpu.segs.length >= 2) {
+          gpuRate = segRate(g.segs[1]); cmpCpuRate = segRate(cpu.segs[1]) ?? cpuRate;
+          gpu = gpuRate != null && gpuRate < cmpCpuRate ? 'faster' : 'slower';
           gpuAcc = g;
-          writeBackendPick(SELFTEST_MODEL, { pick: gpu === 'faster' ? 'webgpu' : 'wasm', gpuRate, cpuRate, by: 'selftest' });
-        }
+        } else gpu = 'unknown';   // 錄音太短，只量到暖機段，不下結論
+        // 只有完整比較（2 段以上）且沒有切到背景才記住；正式辨識之後也會依這筆選擇
+        if (!_selfTest.invalid && (gpu === 'faster' || (gpu === 'slower' && !g.stopped)))
+          writeBackendPick(SELFTEST_MODEL, { pick: gpu === 'faster' ? 'webgpu' : 'wasm', gpuRate, cpuRate: cmpCpuRate, by: 'selftest' });
       } catch (e) { if (e?.message === 'CANCELLED') throw e; gpu = 'failed'; }
       if (_selfTest.invalid) { showSelfTestInvalid(); return; }
     }
     const useGpu = gpu === 'faster';
     const best = useGpu ? { ...gpuAcc, ms: gpuRate * cpu.audioSec * 1000, audioSec: cpu.audioSec } : cpu;
+    const advT = (() => { try { return Number(document.getElementById('advThreads')?.value) || 0; } catch (_) { return 0; } })();
     const r = {
       rtf: useGpu ? gpuRate : cpuRate, cpuRate, gpuRate, gpu, backend: useGpu ? 'webgpu' : 'wasm', dtype: cpu.dtype,
       audioSec: best.audioSec, ms: best.ms, loadMs: cpu.loadMs, encMs: best.encMs, decMs: best.decMs, otherMs: best.otherMs, retries: cpu.retries,
-      isolated: !!self.crossOriginIsolated, threads: threads || wasmThreadCount(), hc: navigator.hardwareConcurrency || 1, power: _powerState,
+      isolated: !!self.crossOriginIsolated, threads: threads || wasmThreadCount(), hc: navigator.hardwareConcurrency || 1, power: _powerState, userThreads: advT,
       isSafari: /Safari\//.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent),
     };
     _selfTestLast = r;
