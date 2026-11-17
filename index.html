@@ -1507,7 +1507,7 @@
       <div class="post-toggle-row">
         <div class="post-toggle-info">
           <div class="post-toggle-name">VAD 語音活動偵測 <span class="fuzzy-badge">v2·Silero</span></div>
-          <div class="post-toggle-desc">Silero VAD v5 神經網路，誤判率 &lt;2%，跳過靜音段落，消除幻覺字幕，節省 20–40% 推論時間</div>
+          <div class="post-toggle-desc">Silero VAD v5 神經網路，誤判率 &lt;2%，跳過靜音段落、減少幻覺字幕；一般課堂錄音通常省 5–15% 時間</div>
         </div>
         <label class="toggle-switch"><input type="checkbox" id="tog_vad" checked><span class="toggle-slider"></span></label>
       </div>
@@ -1726,7 +1726,7 @@
       </div>
       <div class="post-params cols2" id="params_hallucination" style="display:none;">
         <div class="param-group"><label>前後沒字幕超過幾秒，中間的短句算可疑</label><input type="number" id="p_halluc_gap" value="3.0" min="1.0" max="10.0" step="0.5"></div>
-        <div class="param-group"><label>每秒超過幾個字算太快</label><input type="number" id="p_halluc_speed" value="12" min="6" max="30" step="1"></div>
+        <div class="param-group"><label>每秒超過幾個字（英文以單字算）算太快</label><input type="number" id="p_halluc_speed" value="12" min="6" max="30" step="1"></div>
       </div>
       <div class="dict-editor" id="dictEditor">
         <div class="dict-editor-toolbar">
@@ -2881,8 +2881,9 @@ self.addEventListener('message', async (e) => {
           if (!adapter) throw new Error('no adapter');
           device = 'webgpu';
           if (isOnnxCommunity) {
-            // 分離 ONNX：encoder 保留 fp16 精度，decoder 用 q4 壓縮記憶體
-            dtype = { encoder_model: 'fp16', decoder_model_merged: 'q4' };
+            // 分離 ONNX：decoder 用 q4 壓縮記憶體。r10d：encoder 改 fp32——fp16 encoder 在部分顯示卡（含 Intel 內顯）
+            // 會輸出錯字或重複（transformers.js #1590），代價是 encoder 權重約大一倍
+            dtype = { encoder_model: 'fp32', decoder_model_merged: 'q4' };
           } else {
             // 單一 ONNX (Xenova)：WebGPU 預設 fp32，記憶體充足時效果最佳
             dtype = 'fp32';
@@ -3441,7 +3442,7 @@ async function loadModelOnWorker(worker, modelId, dtype, opts = {}, onMsg = null
   throw new Error(modelCorruptUserMsg(modelId));
 }
 
-/** 失敗後重建 Worker 並重載模型。oom／crash：WebGPU 後端 → 改用 WASM（Worker 對 WebGPU 固定用 enc:fp16/dec:q4 或 fp32，忽略 dtype）；
+/** 失敗後重建 Worker 並重載模型。oom／crash：WebGPU 後端 → 改用 WASM（Worker 對 WebGPU 固定用 enc:fp32/dec:q4 或 fp32，忽略 dtype）；
  *  WASM 後端 → 改選更輕的 dtype（寫回 _dtypeCache，本次工作階段延續）。timeout：同設定重建。 */
 async function reloadWorkerForRetry(kind, modelId) {
   // modelId＝本次工作開始時載入的模型。辨識中使用者可能點選別的模型按鈕（selectedModel 隨之改變），重試不可換模型。
@@ -4232,7 +4233,7 @@ document.querySelectorAll('.model-btn').forEach(btn => {
     // WebGPU 時顯示 per-module dtype 預期值；載入後 BACKEND message 更新為實際值
     const isOnnxCommunity = selectedModel.startsWith('onnx-community/') || selectedModel.startsWith('striimit/');
     if (hasGpu) {
-      const dtypeStr = isOnnxCommunity ? 'enc:fp16 / dec:q4' : 'fp32';
+      const dtypeStr = isOnnxCommunity ? 'enc:fp32 / dec:q4' : 'fp32';
       hint.textContent = `⚙ 量化：${dtypeStr} ／ 後端：⚡ WebGPU（載入中更新）`;
     } else {
       hint.textContent = `⚙ 量化：查詢中… ／ 後端：⚪ WASM`;
