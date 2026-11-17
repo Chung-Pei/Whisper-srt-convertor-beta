@@ -4,7 +4,7 @@
 //   H-01  可疑字幕（套話／孤立短句、字速異常、只有括號）→ 預設在預覽「待確認」標出、匯出字幕無 ⚠；老師重述不誤判
 //   H-02  勾選進階「匯出時在可疑字幕前加 ⚠」才寫 ⚠
 import { test, expect, type Page } from '@playwright/test';
-import { newCtx, openWithHook, installScriptedWorker, BASE_URL, type Seg } from './harness';
+import { newCtx, openWithHook, installScriptedWorker, exposeInternals, BASE_URL, type Seg } from './harness';
 import { setToggles, downloadText } from './helpers';
 
 function wav(sec: number): Buffer {
@@ -241,6 +241,93 @@ test.describe('r10c 顯示卡 vs CPU 自動試用', () => {
     const p2 = await ctx.newPage();
     await runTrial(p2, 15000);
     expect(await loadsOf(p2)).toEqual([true]);
+    await ctx.close();
+  });
+});
+
+// ── r10c 第 1 輪覆核修正（M1–M3、S1、S2、S6、S9）
+test.describe('r10c 覆核修正', () => {
+  test('F-M1 暫停中切回前景不會重新開啟螢幕常亮；繼續後才開', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await page.addInitScript(() => {
+      const w = window as any; w.__wl = 0;
+      Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: { request: async () => {
+        w.__wl++; const s = new EventTarget() as any; s.release = async () => { s.dispatchEvent(new Event('release')); }; return s; } } });
+    });
+    await installScriptedWorker(page, { segments: SEGS, rules: [{ segIdx: 1, delay: 1500 }] });
+    await page.goto(BASE_URL);
+    await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+    await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+    await page.locator('#fileInput').setInputFiles({ name: 'wl.wav', mimeType: 'audio/wav', buffer: wav(100) });
+    await page.locator('#startBtn').click();
+    await page.waitForFunction(() => (window as any).__workerLog.some((x: any) => x.type === 'RUN_CHUNK' && x.segIdx === 1));
+    const pb = page.locator('#pauseBtn');
+    await pb.click();
+    await expect(pb).toHaveText('▶ 繼續辨識', { timeout: 10_000 });
+    const before = await page.evaluate(() => (window as any).__wl);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await page.waitForTimeout(300);
+    expect(await page.evaluate(() => (window as any).__wl)).toBe(before);   // 暫停中不重開
+    await pb.click();
+    await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+    expect(await page.evaluate(() => (window as any).__wl)).toBeGreaterThan(before);   // 繼續後有重開
+    await ctx.close();
+  });
+
+  test('F-M2 試用時 CPU 那段逾時 → 不記成「CPU 比較快」，留在顯示卡', async ({ browser }) => {
+    test.setTimeout(120_000);
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await page.addInitScript(() => { if (!(navigator as any).gpu) Object.defineProperty(navigator, 'gpu', { value: { requestAdapter: async () => ({}) }, configurable: true }); });
+    const st = (ms: number) => ({ ms, audioSec: 30, enc: 1, dec: 100, newTokens: 98, loop: null, mode: 'fast', retried: false, flagged: false });
+    await installScriptedWorker(page, { segments: SEGS, backend: 'webgpu', rules: [
+      { segIdx: 0, stats: st(20000) }, { segIdx: 1, stats: st(6000) },
+      { segIdx: 2, attempt: 0, silent: true }, { segIdx: 2, attempt: 1, stats: st(3000) }, { segIdx: 3, stats: st(5000) }] });
+    await exposeInternals(page, [], 'new');
+    await page.goto(BASE_URL);
+    await page.waitForFunction(() => !!(window as any).__t);
+    await page.evaluate(() => (window as any).__t.evalIn('CHUNK_TIMEOUT_MS = 800'));
+    await page.locator('.model-btn[data-model="Xenova/whisper-base"]').click();
+    await setToggles(page, [], ['tog_vad', 'tog_uvr', 'tog_diarization', 'tog_hallucination']);
+    await page.locator('#fileInput').setInputFiles({ name: 'g.wav', mimeType: 'audio/wav', buffer: wav(100) });
+    await page.locator('#startBtn').click();
+    await expect(page.locator('.batch-item.done')).toHaveCount(1, { timeout: 60_000 });
+    const log = await page.locator('#logBox').innerText();
+    expect(log).not.toContain('用 CPU 比較快');
+    expect(log).toContain('CPU 太慢');
+    const pick = await page.evaluate(() => JSON.parse(localStorage.getItem('whisper-backend-pick') || '{}')['Xenova/whisper-base']);
+    expect(pick.pick).toBe('webgpu');
+    expectComplete(await downloadText(page));
+    await ctx.close();
+  });
+
+  test('F-M3/S1/S2 醫學英文名詞不算字速太快；結尾短句、停頓後開講不標；⚠ 不影響判斷', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await openWithHook(ctx, ['detectHallucinations', 'speechUnits'], 'new');
+    const r = await page.evaluate(() => {
+      const T = (window as any).__t;
+      const codes = (subs: any[]) => T.detectHallucinations(subs).map((s: any) => (s._halluReasons || []).map((x: any) => x.code).join(','));
+      return {
+        units: [T.speechUnits('Mycobacterium tuberculosis'), T.speechUnits('IgG、IgM 跟 IgA'), T.speechUnits('好，有沒有問題？')],
+        med: codes([{ start: 0, end: 1.8, text: 'Mycobacterium tuberculosis' }, { start: 2, end: 3.5, text: 'Staphylococcus aureus 的 coagulase' }, { start: 3.6, end: 4, text: '補體補體補體補體補體' }]),
+        tail: codes([{ start: 0, end: 3, text: '今天的課就到這裡' }, { start: 10, end: 12, text: '我們休息十分鐘。' }]),
+        resume: codes([{ start: 0, end: 3, text: '先講到這裡' }, { start: 10, end: 13, text: '接下來看 T cell 的活化' }, { start: 20, end: 22, text: '然後抗原呈現' }]),
+        warn: codes([{ start: 0, end: 2, text: '⚠ 〔音樂〕' }]),
+      };
+    });
+    expect(r.units).toEqual([2, 4, 6]);
+    expect(r.med).toEqual(['', '', 'speed']);
+    expect(r.tail).toEqual(['', '']);
+    expect(r.resume).toEqual(['', '', '']);
+    expect(r.warn).toEqual(['bracket']);
+    await ctx.close();
+  });
+
+  test('F-S9 開關名稱不重複 ⚠', async ({ browser }) => {
+    const ctx = await newCtx(browser); const page = await ctx.newPage();
+    await page.goto(BASE_URL);
+    const html = await page.content();
+    expect(html).toContain('匯出時在可疑字幕前加 ⚠（進階）');
+    expect(html).not.toContain('⚠ 匯出時在可疑字幕前加');
     await ctx.close();
   });
 });

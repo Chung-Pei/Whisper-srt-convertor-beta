@@ -1719,7 +1719,7 @@
 
       <div class="post-toggle-row" style="border-top:1px solid rgba(255,255,255,0.04);margin-top:0.2rem;padding-top:0.45rem;">
         <div class="post-toggle-info">
-          <div class="post-toggle-name">⚠ 匯出時在可疑字幕前加 ⚠（進階）</div>
+          <div class="post-toggle-name">匯出時在可疑字幕前加 ⚠（進階）</div>
           <div class="post-toggle-desc">可疑字幕（像「謝謝觀看」這類套話、前後很久沒聲音卻冒出的短句、字速太快、只有括號的聲音描述）一律會自動在下方預覽標出，字幕檔保持乾淨。打開這個開關，才會把 ⚠ 也寫進字幕檔（燒進影片也看得到），一般不需要。</div>
         </div>
         <label class="toggle-switch"><input type="checkbox" id="tog_hallucination"><span class="toggle-slider"></span></label>
@@ -1916,7 +1916,8 @@ async function releaseWakeLock() {
 
 // iOS / 頁面從背景切回前景時自動重新 acquire（iOS 強制釋放 Wake Lock）
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && isRunning && !_wakeLock) {
+  // r10c：暫停中（_pauseResolve 非 null）不要重新開啟螢幕常亮
+  if (document.visibilityState === 'visible' && isRunning && !_pauseResolve && !_wakeLock) {
     await acquireWakeLock();
   }
 });
@@ -5997,14 +5998,17 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       }).catch(() => {});
     };
 
+    if (!pauseBtn?.classList.contains('show')) setPauseUi(pauseRequested ? 'pending' : 'run');   // 覆核 S6
     try {
     while (true) {
-      if (isCancelled) throw new Error('CANCELLED');
-      await maybePauseHere(saveResumePoint);   // r10c：安全點（上一段已定稿、doneSec／pending 一致）
       if (isCancelled) throw new Error('CANCELLED');
 
       const { value: seg, done } = await nextSegPromise;
       if (done) break;
+      // r10c：安全點（上一段已定稿、doneSec／pending 一致）。放在確認還有下一段之後（覆核 S6：最後一段時按暫停不會停在 100%）；
+      // 讀下一段音訊不會推論，暫停期間 Worker 閒著。
+      await maybePauseHere(saveResumePoint);
+      if (isCancelled) throw new Error('CANCELLED');
       nextSegPromise = gen.next();
 
       // 跳過已完成段落
@@ -6187,6 +6191,11 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
           }
         } else if (_trial.stage === 'gpu' && _lastBackend !== 'webgpu') {
           _trial = null;   // 顯示卡根本沒用上（失敗退回 CPU），不用比
+        } else if (_trial.stage === 'cpu' && _lastBackend === 'webgpu') {
+          // r10c 覆核 M2：CPU 那段逾時／出錯，重試時已回到顯示卡 → 這次量到的不是 CPU；CPU 慢到逾時，就留在顯示卡
+          writeBackendPick(runModel, { pick: 'webgpu', gpuRate: _trial.gpuRate });
+          log('✓ 比較結果：這台電腦用 CPU 太慢（來不及辨識完一段），繼續用顯示卡。', 'ok');
+          _trial = null;
         } else if (_trial.stage === 'cpu' && rate != null) {
           const g = _trial.gpuRate, c = rate;
           const perMin = (r) => Math.max(1, Math.round(r * 60));
@@ -6196,7 +6205,9 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
           } else {
             writeBackendPick(runModel, { pick: 'webgpu', gpuRate: g, cpuRate: c });
             log(`✓ 比較結果：這台電腦用顯示卡比較快（每 1 分鐘音訊：顯示卡約 ${perMin(g)} 秒、CPU 約 ${perMin(c)} 秒），換回顯示卡。`, 'ok');
-            if (i < windows.length) worker = await switchWorkerBackend(runModel, true);
+            // 覆核 S5：就算這已是最後一段也換回顯示卡（批次下一個檔案才不會整檔跑 CPU）；換不回就繼續用 CPU
+            try { worker = await switchWorkerBackend(runModel, true); }
+            catch (e) { if (e?.message === 'CANCELLED') throw e; log('（換回顯示卡失敗，這次繼續用 CPU）', 'info'); }
           }
           _trial = null;
         }
@@ -6393,9 +6404,9 @@ async function maybePauseHere(saveFn) {
   await new Promise((resolve) => { _pauseResolve = resolve; });
   _pauseResolve = null;
   if (isCancelled) return;
-  await acquireWakeLock();
-  setPauseUi('run');
+  setPauseUi('run');   // 覆核 S7(b)：先改按鈕再等螢幕常亮，期間按「暫停」才不會被覆寫
   log('▶ 繼續辨識', 'ok');
+  await acquireWakeLock();
 }
 pauseBtn?.addEventListener('click', () => {
   if (_pauseResolve) { _pauseResolve(); return; }            // 暫停中 → 繼續
@@ -6443,7 +6454,7 @@ startBtn.addEventListener('click', async () => {
   cancelBtn.textContent = '✕ 取消辨識';
   cancelBtn.disabled = false;
   pauseRequested = false;
-  setPauseUi('run');
+  setPauseUi('hide');   // 覆核 S6：下載模型、人聲分離時不顯示；辨識迴圈開始才出現
   batchSummaryEl.classList.remove('show');
 
   document.getElementById('spinner').classList.add('show');
@@ -7583,21 +7594,30 @@ async function applyFuzzyMedicalDict(subs, dict, threshold = FUZZY_THRESHOLD_DEF
 // 重複詞組改由轉錄當下的鬼打牆偵測負責（舊的「同一行 2–4 字片段出現 2 次」會把老師的重述大量誤判，已拿掉）。
 // 留下三項＋常見套話：① 前後都長時間沒字、孤零零冒出的一句短字幕（或常見套話）② 字速異常 ③ 只有括號的聲音描述。
 const HALLU_PHRASE_RE = /(謝謝(大家)?(收看|觀看)|請不吝|點贊|點讚|訂閱|字幕(由|製作|by)|Amara|明鏡與點點|中文字幕)/i;
+const HALLU_ISOLATED_MAX = 6;   // 覆核 S1：孤立句只標極短的（≤6 字），停頓後正常開講的句子不標
+/** 說話量單位：中日韓文字一字＝1、英文單字或數字（連續）＝1，標點與空白不算 */
+function speechUnits(text) {
+  const t = String(text ?? '');
+  const cjk = (t.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu) || []).length;
+  const words = (t.match(/[A-Za-z0-9\u00C0-\u024F]+/g) || []).length;
+  return cjk + words;
+}
 function detectHallucinations(subs, gapThreshold = 3.0, speedThreshold = 12) {
   if (!subs || subs.length === 0) return subs;
   return subs.map((s, i) => {
     const reasons = [];
-    const text  = (s.text ?? '').trim();
+    const text  = (s.text ?? '').trim().replace(/^⚠\s*/, '');   // 覆核 S2：已加 ⚠ 的文字也能正確判斷
     const dur   = (s.end ?? 0) - (s.start ?? 0);
-    const chars = text.replace(/\s/g, '').length;
+    const chars = speechUnits(text);   // 覆核 M3：中日韓一字＝1、英文單字（連續字母／數字）＝1、標點不算
     const gapBefore = i > 0 ? (s.start ?? 0) - (subs[i - 1].end ?? 0) : (s.start ?? 0);
-    const gapAfter  = i < subs.length - 1 ? (subs[i + 1].start ?? 0) - (s.end ?? 0) : Infinity;
+    // 覆核 S1：最後一句後面沒有字幕不算「很久沒字」（課堂結尾「我們休息十分鐘」不該被標）
+    const gapAfter  = i < subs.length - 1 ? (subs[i + 1].start ?? 0) - (s.end ?? 0) : 0;
     const brackets = /^[[(（「【〔].+[\])）」】〕]$/.test(text);
     // ③ 只有括號
     if (brackets) reasons.push({ code: 'bracket', text: '只有括號裡的聲音描述（例如〔音樂〕），可能不是說話內容' });
     // ① 常見套話；或前後都很久沒字、孤零零的一句短字幕（課堂停頓後正常開講不會被標：後面通常緊接著下一句）
     else if (HALLU_PHRASE_RE.test(text)) reasons.push({ code: 'phrase', text: '像影片常見的套話（例如「謝謝觀看」），可能不是老師說的，建議重聽' });
-    else if (chars > 0 && chars <= 15 && gapBefore > gapThreshold && gapAfter > gapThreshold)
+    else if (chars > 0 && chars <= HALLU_ISOLATED_MAX && gapBefore > gapThreshold && gapAfter > gapThreshold)
       reasons.push({ code: 'isolated', text: '前後都很久沒有字幕，中間冒出一句短字幕，可能是模型自己補的，建議重聽' });
     // ② 字速異常（字／秒）
     if (dur > 0 && chars >= 4 && chars / dur > speedThreshold)
