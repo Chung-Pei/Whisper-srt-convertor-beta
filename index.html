@@ -3672,7 +3672,50 @@ function writeBackendPick(modelId, rec) {
     localStorage.setItem(BACKEND_PICK_KEY, JSON.stringify(all));
   } catch (_) {}
 }
+// ── r10d：內建顯示卡偵測 ─────────────────────────────────────────────
+// 使用者真機（Intel UHD 內顯、6 核）：base 用顯示卡每 1 分鐘音訊約 154 秒，CPU 約 15 秒（快 10 倍）。
+// 所以內建顯示卡＋base／small 直接用 CPU，不再先在顯示卡上試跑浪費幾分鐘；獨立顯示卡或判斷不出來的照舊自動比較。
+let _gpuKind = null;   // 'integrated'｜'discrete'｜'unknown'｜'none'
+let _gpuInfo = null;
+let _gpuProbeP = null;
+/** 純函式：依 WebGPU adapter.info 判斷顯示卡種類（只靠廠商與型號字串，判斷不出來就回 'unknown'） */
+function classifyGpu(info) {
+  if (!info) return 'unknown';
+  if (info.fallback) return 'integrated';   // 軟體模擬的顯示卡
+  const v = String(info.vendor || '').toLowerCase();
+  const d = (String(info.architecture || '') + ' ' + String(info.description || '')).toLowerCase();
+  if (/nvidia/.test(v) || /nvidia|geforce|rtx|quadro/.test(d)) return 'discrete';
+  if (/intel/.test(v) || /intel/.test(d)) return /\barc\b|xe-hpg|alchemist|battlemage/.test(d) ? 'discrete' : 'integrated';
+  if (/qualcomm|arm|imagination|mali|adreno|powervr/.test(v + ' ' + d)) return 'integrated';
+  return 'unknown';   // AMD、Apple 等：內顯獨顯都有，交給自動比較
+}
+function probeGpuKind() {
+  if (_gpuProbeP) return _gpuProbeP;
+  _gpuProbeP = (async () => {
+    try {
+      if (!isWebGPUSupported()) { _gpuKind = 'none'; return _gpuKind; }
+      const a = await Promise.race([navigator.gpu.requestAdapter(), new Promise((r) => setTimeout(() => r(undefined), 3000))]);
+      if (!a) { _gpuKind = 'none'; return _gpuKind; }
+      let info = a.info || null;
+      if (!info && typeof a.requestAdapterInfo === 'function') { try { info = await a.requestAdapterInfo(); } catch (_) {} }
+      _gpuInfo = info ? { vendor: String(info.vendor || ''), architecture: String(info.architecture || ''), description: String(info.description || ''),
+        fallback: !!(a.isFallbackAdapter || info.isFallbackAdapter) } : null;
+      _gpuKind = classifyGpu(_gpuInfo);
+    } catch (_) { _gpuKind = 'unknown'; }
+    return _gpuKind;
+  })();
+  return _gpuProbeP;
+}
+const _isCpuSizedModel = (modelId) => /whisper-(base|small)\b/i.test(String(modelId));
+/** 這台是內建顯示卡、模型是 base／small、而且沒有「顯示卡比較快」的實測紀錄 → 直接用 CPU */
+function integratedGpuPrefersCpu(modelId) {
+  if (_gpuKind !== 'integrated' || !_isCpuSizedModel(modelId)) return false;
+  const pick = readBackendPick(modelId);
+  return !(pick && pick.pick === 'webgpu');
+}
+
 function backendTrialEligible(modelId) {
+  if (integratedGpuPrefersCpu(modelId)) return false;
   return isWebGPUSupported() && !_gpuFailedModels.has(modelId) && /whisper-(base|small)\b/i.test(String(modelId)) && !readBackendPick(modelId);
 }
 /** 換後端重載（試用與挑選結果共用）；終止舊 Worker，釋放記憶體 */
@@ -3702,6 +3745,7 @@ function defaultPreferGpu(modelId) {
   if (!isWebGPUSupported() || _gpuFailedModels.has(modelId)) return false;
   const pick = readBackendPick(modelId);
   if (pick && pick.pick === 'wasm') return false;   // r10c：這台電腦試過，CPU 比較快
+  if (integratedGpuPrefersCpu(modelId)) return false;   // r10d：內建顯示卡＋base／small → CPU
   const big = /whisper-(medium|large)/i.test(String(modelId));
   return !(big && detectMemoryTier().tier === 'low');
 }
@@ -5875,6 +5919,9 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
     inferenceWorker = worker;
 
     if (!workerReady || loadedModel !== selectedModel) {
+      await probeGpuKind();
+      if (integratedGpuPrefersCpu(selectedModel))
+        log('🖥 這台電腦只有內建顯示卡：這個模型直接用 CPU（多核心）辨識，通常比內建顯示卡快很多。', 'info');
       log(`載入模型：${selectedModel}（首次需下載）`, 'info');
       setProgress(0, '下載/載入模型...', true);
 
@@ -6177,7 +6224,9 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         const rate = trialRate(st);
         if (_trial.stage === 'gpu' && _lastBackend === 'webgpu') {
           _trial.gpuSeen++;
-          if (_trial.gpuSeen >= 2 && rate != null) {   // 第 1 段是顯示卡暖機（編譯著色器），不算
+          // 第 1 段是顯示卡暖機（編譯著色器），通常不算；r10d：但第 1 段就比錄音本身還慢（每秒音訊 >1 秒）→ 不用再等，立刻換 CPU 比
+          const slowFirst = _trial.gpuSeen === 1 && rate != null && rate > 1.0;
+          if ((_trial.gpuSeen >= 2 || slowFirst) && rate != null) {
             _trial.gpuRate = rate;
             if (i < windows.length) {
               log('🧪 第一次用這個模型：正在比較顯示卡和 CPU 哪個比較快（只比一次，字幕照常產生）…', 'info');
@@ -6208,7 +6257,12 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
             log(`✓ 比較結果：這台電腦用顯示卡比較快（每 1 分鐘音訊：顯示卡約 ${perMin(g)} 秒、CPU 約 ${perMin(c)} 秒），換回顯示卡。`, 'ok');
             // 覆核 S5：就算這已是最後一段也換回顯示卡（批次下一個檔案才不會整檔跑 CPU）；換不回就繼續用 CPU
             try { worker = await switchWorkerBackend(runModel, true); }
-            catch (e) { if (e?.message === 'CANCELLED') throw e; log('（換回顯示卡失敗，這次繼續用 CPU）', 'info'); }
+            catch (e) {
+              if (e?.message === 'CANCELLED') throw e;
+              log('（換回顯示卡失敗，這次繼續用 CPU）', 'info');
+              // r10c 上線後覆核 S-A：失敗時舊的 CPU Worker 已被終止 → 重建一個 CPU Worker，不要拿已終止的去跑下一段（會等到逾時）
+              worker = await switchWorkerBackend(runModel, false);
+            }
           }
           _trial = null;
         }
