@@ -838,6 +838,31 @@
   .btn-pause.show { display: flex; }
   .btn-pause.paused { background: var(--accent); color: var(--bg); }
   .btn-pause:disabled { opacity: 0.6; cursor: default; }
+  /* r10d：一鍵自測、開工前檢查、效能資訊 */
+  .selftest-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; margin: -0.3rem 0 0.7rem; }
+  .btn-diag { min-height: 40px; padding: 0.5rem 0.9rem; font-size: 0.9rem; border-radius: var(--radius); cursor: pointer;
+    background: transparent; border: 1.5px solid var(--accent); color: var(--accent); font-weight: 600; }
+  .btn-diag:disabled { opacity: 0.55; cursor: default; }
+  .selftest-hint { font-size: 0.9rem; color: var(--muted); }
+  .selftest-prompt, .selftest-result, .preflight { display: none; border-radius: var(--radius); padding: 0.75rem 0.9rem; margin-bottom: 0.8rem; font-size: 0.92rem; line-height: 1.55; }
+  .selftest-prompt.show, .selftest-result.show, .preflight.show { display: block; }
+  .selftest-prompt { border: 1px dashed var(--accent); }
+  .selftest-result { border: 1.5px solid var(--muted); }
+  .selftest-result[data-state=green] { border-color: #2e9d5b; }
+  .selftest-result[data-state=yellow], .selftest-result[data-state=invalid-bg] { border-color: #d9a400; }
+  .selftest-result[data-state=red] { border-color: #d64545; }
+  .selftest-title { font-weight: 700; font-size: 1rem; }
+  .selftest-result ul, .preflight ul { margin: 0.4rem 0 0.4rem 1.1rem; padding: 0; }
+  .selftest-result li[data-cause=no-isolation] { color: #d64545; font-weight: 700; }
+  .selftest-btns { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+  .preflight { background: rgba(217,164,0,0.12); border: 1.5px solid #d9a400; }
+  .run-note { display: none; font-size: 0.9rem; margin-bottom: 0.4rem; }
+  .run-note.show { display: block; }
+  #bgWarn { color: #b8860b; font-weight: 600; }
+  .perf-details { margin: 0.6rem 0; font-size: 0.9rem; }
+  .perf-details summary { cursor: pointer; min-height: 40px; display: flex; align-items: center; }
+  .perf-details pre { white-space: pre-wrap; word-break: break-all; font-size: 0.8rem; margin: 0.4rem 0; }
+  @media (max-width: 600px) { .btn-diag { width: 100%; } }
   .pause-note { display: none; font-size: 0.9rem; line-height: 1.5; margin: -0.2rem 0 0.8rem; color: var(--text, inherit); }
   .pause-note.show { display: block; }
   .btn-cancel:hover { background: rgba(255,90,90,0.08); }
@@ -1428,6 +1453,27 @@
   </div>
 
   <div class="section-title">語音模型</div>
+  <!-- r10d：一鍵測試這台電腦 -->
+  <div class="selftest-row">
+    <button class="btn-diag" id="btnSelfTest" type="button" data-state="idle">🩺 測試這台電腦（約 30 秒）</button>
+    <span class="selftest-hint" id="selfTestHint" role="status" aria-live="polite"></span>
+  </div>
+  <div class="selftest-prompt" id="selfTestPrompt" data-state="dismissed">
+    第一次使用？先花 30 秒測試這台電腦，會告訴你轉一堂課大約要多久、哪裡可以更快。
+    <div class="selftest-btns">
+      <button class="btn-diag" id="btnSelfTestGo" type="button">開始測試</button>
+      <button class="btn-diag" id="btnSelfTestLater" type="button">以後再說</button>
+    </div>
+  </div>
+  <div class="selftest-result" id="selfTestResult" data-state="hidden" role="status" aria-live="polite">
+    <div class="selftest-title" id="selfTestTitle"></div>
+    <div id="selfTestSummary"></div>
+    <ul id="selfTestCauses"></ul>
+    <div class="selftest-btns">
+      <button class="btn-diag" id="btnCopySelfTest" type="button">📋 複製結果</button>
+      <button class="btn-diag" id="btnSelfTestAgain" type="button">再測一次</button>
+    </div>
+  </div>
   <div class="model-strip">
     <button class="model-btn active" data-model="Xenova/whisper-base" data-warn="">base (~145MB)</button>
     <button class="model-btn" data-model="Xenova/whisper-small" data-warn="">small (~460MB)</button>
@@ -1513,6 +1559,13 @@
       </div>
       <div class="post-params cols1" id="params_vad" style="display:grid;">
         <div class="param-group"><label>語音靈敏度閾值（Silero: 0.5=標準 / 0.3=寬鬆 / 0.7=嚴格）</label><input type="number" id="p_vad_threshold" value="0.5" min="0.1" max="0.9" step="0.05"></div>
+      </div>
+      <div class="post-toggle-row">
+        <div class="post-toggle-info">
+          <div class="post-toggle-name">運算線路（CPU 同時用幾個核心）</div>
+          <div class="post-toggle-desc">自動通常最快；只在測試時調整。改了以後，下次按「開始」才生效。</div>
+        </div>
+        <select id="advThreads" data-state="auto" style="min-height:40px;font-size:0.9rem;"></select>
       </div>
 
       <div class="post-section-label">音質優化</div>
@@ -1767,6 +1820,12 @@
     </div>
   </div>
 
+  <div class="preflight" id="preflight" data-state="hidden" role="status" aria-live="polite">
+    <strong>開始前提醒（不影響辨識，照常進行）</strong>
+    <ul id="preflightList"></ul>
+    <button class="btn-diag" id="btnPreflightOk" type="button">知道了</button>
+  </div>
+
   <button class="btn-main" id="startBtn" disabled>
     <div class="spinner" id="spinner"></div>
     <span id="btnTxt">▶ 開始辨識</span>
@@ -1792,6 +1851,8 @@
     <div class="prog-track">
       <div class="prog-fill indeterminate" id="progFill"></div>
     </div>
+    <div class="run-note" id="keepAwakeNote" data-state="hidden"></div>
+    <div class="run-note" id="bgWarn" data-state="hidden" role="status"></div>
     <div class="prog-eta" id="progEta"></div>
     <!-- r9：人聲分離被略過時在畫面上說明（不只寫日誌） -->
     <div class="warn-box" id="uvrNotice" role="status" style="display:none;margin-top:0.5rem;"></div>
@@ -1813,6 +1874,11 @@
       <div class="stat"><div class="stat-val" id="statDur">—</div><div class="stat-lbl">總時長</div></div>
       <div class="stat"><div class="stat-val" id="statModel">—</div><div class="stat-lbl">模型</div></div>
     </div>
+    <details class="perf-details" id="perfDetails" style="display:none;">
+      <summary>⏱ 效能資訊（各階段花多少時間）</summary>
+      <pre id="perfText"></pre>
+      <button class="btn-diag" id="btnCopyPerf" type="button">📋 複製</button>
+    </details>
     <div class="preview-box" id="srtPreview" style="display:none;"></div>
 
     <!-- 字幕編輯器 -->
@@ -3124,7 +3190,7 @@ function createWorker() {
     inferenceWorker = null;
     workerReady = false;
   }
-  inferenceWorker = spawnWorker(WORKER_CODE);
+  inferenceWorker = spawnWorker(workerCodeWithThreads());
   // r9-fix：Worker 發現並刪除損壞的暫存模型檔時，用白話記一筆（之後會自動重新下載該檔）
   inferenceWorker.addEventListener('message', (e) => {
     if (e.data?.type === 'PROMPT_INFO') reportPromptInfo(e.data.payload ?? {});
@@ -4095,7 +4161,13 @@ function formatSegStats(n, st) {
     if (st.flagged) extra += `；已標記待確認${st.lostSec ? `（後面約 ${st.lostSec} 秒可能漏字）` : ''}`;
   }
   if (st.mode === 'seek-retry') extra += '；這段話很密，已用完整模式重跑一次';
-  return `⏲ 段落 ${n}：${(st.audioSec || 0).toFixed(1)} 秒音訊花 ${(st.ms / 1000).toFixed(1)} 秒（${parts.join('、')}）${extra}`;
+  // r10d：各階段（聽＝encoder、寫＝decoder、整理＝其餘 JS 後處理）
+  let stage = '';
+  if (st.encMs != null && st.decMs != null && st.ms > 0) {
+    const f = (ms) => (Math.max(0, ms) / 1000).toFixed(1) + 's';
+    stage = `｜聽 ${f(st.encMs)}・寫 ${f(st.decMs)}・整理 ${f(st.ms - st.encMs - st.decMs)}`;
+  }
+  return `⏲ 段落 ${n}：${(st.audioSec || 0).toFixed(1)} 秒音訊花 ${(st.ms / 1000).toFixed(1)} 秒（${parts.join('、')}）${extra}${stage}`;
 }
 
 function resetEta() {
@@ -4448,6 +4520,7 @@ function escapeHtml(str) {
 }
 
 function renderBatchQueue() {
+  setTimeout(() => { try { maybeShowSelfTestPrompt(); } catch (_) {} }, 0);   // r10d：選了檔、沒測過 → 提示自測
   _previewNoticeCleanups.forEach(fn => fn());
   _previewNoticeCleanups = [];
   batchListEl.innerHTML = '';
@@ -5884,6 +5957,8 @@ async function whisperModelAvailableOffline(modelId) {
 
 async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts = {}) {
   outputContent = '';
+  const perf = newPerfStats();   // r10d：各階段計時
+  setPauseUi(pauseRequested ? 'pending' : 'hide');   // r10c 上線後覆核 S-C：批次下一檔準備中（下載模型、人聲分離）不顯示「暫停」，已按暫停則顯示等待中
   setProgress(0, '準備中...', true);
   log(`▸ 開始辨識：${file.name}`, 'info');
 
@@ -5949,6 +6024,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       worker.addEventListener('message', progressHandler);
 
       const loadingModelId = selectedModel;  // 捕捉此次載入的目標模型 ID
+      const _tLoad = performance.now();
       try {
         worker = await loadModelOnWorker(worker, loadingModelId, dtype, {}, progressHandler);
       } finally {
@@ -5957,6 +6033,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       }
       workerReady  = true;
       loadedModel  = loadingModelId;  // 記錄實際載入成功的模型 ID
+      perf.loadMs = performance.now() - _tLoad;
       log(`模型載入完成 ✓`, 'ok');
     }
     // 本次工作使用的模型：此處與上方的載入判斷之間沒有 await，所以必等於 selectedModel；
@@ -6099,6 +6176,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
         skipped.push({ idx: i, startSec: seg.startSec });
         flushPending();   // 這一窗失敗：前一窗重疊區的字全部保留
         failStreak++;
+        perf.retries++;
         log(`⚠ 段落 ${i+1} 跳過`, 'warn');
         if (failStreak >= MAX_FAIL_STREAK) throw new Error(`連續 ${failStreak} 段辨識失敗，已停止（最後錯誤：${res.error}）`);
         i++; continue;
@@ -6148,6 +6226,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
             const len = parts.reduce((a, x) => a + x.length, 0);
             const slice = new Float32Array(len); let off = 0; for (const x of parts) { slice.set(x, off); off += x.length; }
             if (len > SR && mostlyVoiced(slice, SR)) {
+              perf.gapFills++;
               const gr = await runChunkOnWorker(worker, { ...base, startSec: g0, gapFill: true }, slice);
               if (isCancelled) throw new Error('CANCELLED');
               if (gr.ok) {
@@ -6203,6 +6282,7 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       const st = evt.payload.stats;
       if (st && st.ms > 0) {
         segTimes.push({ audioSec: st.audioSec || (seg.endSec - seg.startSec), ms: st.ms });
+        addPerfSeg(perf, st, seg.endSec - seg.startSec);
         log(formatSegStats(i, st), st.loop ? 'warn' : 'info');
         if (st.loop) loopSegs++;
         if (st.flagged) {
@@ -6287,6 +6367,13 @@ async function runInference(file, resumeFromChunk = 0, resumeChunks = [], opts =
       // 覆核 r3 S-j：分開說原因（鬼打牆 vs 接縫），不把接縫寫成「模型一直重複」
       const seamN = reviewMarks.filter((m) => m.kind === 'seam').length;
       showUvrNotice(`有 ${reviewMarks.length} 段可能漏字${seamN > 0 ? `（其中 ${seamN} 段在兩段接縫處）` : ''}，已在下方預覽標出，可點選重聽確認。`, file && file.name);
+    }
+    perf.backend = _lastBackend;
+    _lastPerf = perf;
+    if (perf.segs > 0) {
+      log(formatPerfSummary(perf), 'ok');
+      const pd = document.getElementById('perfDetails');
+      if (pd) { document.getElementById('perfText').textContent = perfCopyText(perf); pd.style.display = ''; }
     }
     if (loopSegs > 0) log(`⏲ 量測合計：${segTimes.length} 段，其中 ${loopSegs} 段出現重複迴圈（全部待確認標記共 ${reviewMarks.length} 段）`, 'info');
     // r9 覆核 N12：照抄提示詞被移除時，完成畫面也要說（不只寫在日誌），老師可回頭核對
@@ -6490,6 +6577,372 @@ cancelBtn.addEventListener('click', () => {
   }
 });
 
+
+// ══ r10d 診斷版：各階段計時、開工前檢查、背景分頁／未插電提醒、一鍵自測、運算線路 ══════════════
+const R10D_VERSION = 'v24 r10d';
+/** 新 Worker 依目前「運算線路」設定建立（WORKER_CODE 內的覆寫值是頁面載入時的值） */
+function workerCodeWithThreads() {
+  return WORKER_CODE.replace(/self\.__whisperThreadsOverride = (?:null|\d+);/, 'self.__whisperThreadsOverride = ' + JSON.stringify(self.__whisperThreadsOverride || null) + ';');
+}
+function newPerfStats() {
+  return { loadMs: 0, segs: 0, audioSec: 0, ms: 0, encMs: 0, decMs: 0, otherMs: 0, retries: 0, gapFills: 0, wallStart: performance.now(), backend: null };
+}
+/** 一段的量測併進總計（純函式，供測試） */
+function addPerfSeg(perf, st, fallbackAudioSec) {
+  if (!perf || !st || !(st.ms > 0)) return perf;
+  perf.segs++;
+  perf.audioSec += st.audioSec || fallbackAudioSec || 0;
+  perf.ms += st.ms;
+  const enc = Number(st.encMs) || 0, dec = Number(st.decMs) || 0;
+  perf.encMs += enc; perf.decMs += dec; perf.otherMs += Math.max(0, st.ms - enc - dec);
+  if (st.retried) perf.retries++;
+  if (st.mode === 'seek-retry') perf.retries++;
+  return perf;
+}
+function fmtSecs(sec) {
+  sec = Math.max(0, sec);
+  if (sec < 60) return `${sec < 10 ? sec.toFixed(1) : Math.round(sec)} 秒`;
+  const m = Math.floor(sec / 60), ss = Math.round(sec % 60);
+  if (m < 60) return ss ? `${m} 分 ${ss} 秒` : `${m} 分`;
+  return `${Math.floor(m / 60)} 時 ${String(m % 60).padStart(2, '0')} 分`;
+}
+/** 三個階段的百分比（加總 100，最大的一項吸收四捨五入誤差） */
+function perfShares(perf) {
+  const tot = perf.encMs + perf.decMs + perf.otherMs;
+  if (!(tot > 0)) return [0, 0, 0];
+  const raw = [perf.encMs, perf.decMs, perf.otherMs].map((v) => Math.round(v / tot * 100));
+  const diff = 100 - raw.reduce((a, b) => a + b, 0);
+  const k = raw.indexOf(Math.max(...raw)); raw[k] += diff;
+  return raw;
+}
+function currentThreadsText() {
+  const th = typeof _cpuThreadsLogged === 'number' && _cpuThreadsLogged > 0 ? _cpuThreadsLogged : wasmThreadCount();
+  return `${th} 條線路、${self.crossOriginIsolated ? '已隔離' : '未隔離'}`;
+}
+function formatPerfSummary(perf) {
+  const [e, d, o] = perfShares(perf);
+  const wall = (performance.now() - perf.wallStart) / 1000 + perf.loadMs / 1000;
+  const be = perf.backend === 'webgpu' ? '顯示卡' : 'CPU';
+  return `⏱ 總計 ${fmtSecs(wall)}：載入模型 ${fmtSecs(perf.loadMs / 1000)}｜聽音訊 ${fmtSecs(perf.encMs / 1000)}（${e}%）｜寫字 ${fmtSecs(perf.decMs / 1000)}（${d}%）｜整理字幕 ${fmtSecs(perf.otherMs / 1000)}（${o}%）｜重試 ${perf.retries} 次｜補聽接縫 ${perf.gapFills} 次｜${be}・${currentThreadsText()}`;
+}
+let _lastPerf = null;
+let _powerState = '不明';   // 插電｜未插電｜不明
+async function readPowerState() {
+  try {
+    if (typeof navigator.getBattery !== 'function') return (_powerState = '不明');
+    const b = await navigator.getBattery();
+    _powerState = b && b.charging === false ? '未插電' : (b && b.charging ? '插電' : '不明');
+  } catch (_) { _powerState = '不明'; }
+  return _powerState;
+}
+function envLines() {
+  const nav = navigator, ua = nav.userAgent || '';
+  const m = ua.match(/(Edg|Chrome|Firefox|Version)\/(\d+)/);
+  const os = /Windows/.test(ua) ? 'Windows' : /Mac OS X/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /iPhone|iPad/.test(ua) ? 'iOS' : /Linux/.test(ua) ? 'Linux' : '?';
+  const th = typeof _cpuThreadsLogged === 'number' && _cpuThreadsLogged > 0 ? _cpuThreadsLogged : wasmThreadCount();
+  return {
+    env: `isolated=${!!self.crossOriginIsolated} threads=${th} hc=${nav.hardwareConcurrency || '?'} deviceMemory=${nav.deviceMemory || '?'} 電源=${_powerState}`,
+    gpu: `gpu=${_gpuKind || '?'}${_gpuInfo ? `(${[_gpuInfo.vendor, _gpuInfo.architecture].filter(Boolean).join(' ')})` : ''}`,
+    ua: `UA=${m ? (m[1] === 'Edg' ? 'Edge' : m[1] === 'Version' ? 'Safari' : m[1]) + ' ' + m[2] : '?'} ${os}`,
+  };
+}
+function stamp() { const d = new Date(), z = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())} ${z(d.getHours())}:${z(d.getMinutes())}`; }
+function perfCopyText(perf) {
+  const E = envLines(), rtf = perf.audioSec > 0 ? perf.ms / 1000 / perf.audioSec : 0;
+  const s1 = (ms) => (ms / 1000).toFixed(1) + 's';
+  return [`[Whisper 轉檔] ${R10D_VERSION} ${stamp()}`,
+    `rtf=${rtf.toFixed(2)} 倍速=${rtf > 0 ? (1 / rtf).toFixed(2) : '?'} 音訊=${Math.round(perf.audioSec)}s 處理=${s1(perf.ms)} 段數=${perf.segs}`,
+    E.env,
+    `backend=${perf.backend || '?'} ${E.gpu} 載入=${s1(perf.loadMs)} encoder=${s1(perf.encMs)} decoder=${s1(perf.decMs)} js=${s1(perf.otherMs)} 重試=${perf.retries} 補聽=${perf.gapFills}`,
+    E.ua].join('\n');
+}
+async function copyText(txt) {
+  try { await navigator.clipboard.writeText(txt); return true; }
+  catch (_) {
+    try { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); const ok = document.execCommand('copy'); ta.remove(); return ok; } catch (__) { return false; }
+  }
+}
+function flashHint(el, msg) { if (!el) return; el.textContent = msg; clearTimeout(el._t); el._t = setTimeout(() => { el.textContent = ''; }, 4000); }
+document.getElementById('btnCopyPerf')?.addEventListener('click', async () => {
+  const ok = await copyText(document.getElementById('perfText').textContent || '');
+  showToast(ok ? '已複製，貼回對話即可' : '複製失敗，請手動選取文字複製');
+});
+function showToast(msg) {
+  if (typeof window.toast === 'function') { try { window.toast(msg); return; } catch (_) {} }
+  flashHint(document.getElementById('selfTestHint'), msg);
+}
+
+// ── 開工前檢查（只提醒，不擋人）
+/** 純函式：依環境列出要提醒的項目 */
+function preflightChecks(env) {
+  const out = [];
+  if (env.threads <= 1 && env.hc > 1) out.push({ key: 'threads', text: env.isIOS
+    ? 'iPhone／iPad 只能用 1 條運算線路，長的錄音會很久，建議改在電腦上用 Chrome 或 Edge。'
+    : '這次只能用 1 條運算線路，50 分鐘的課可能要 3 小時以上。建議關掉這個分頁重新開一次，或改用 Chrome／Edge。' });
+  if (env.power === '未插電') out.push({ key: 'power', text: '沒有接電源：電腦可能自動降速。請接上電源，Windows 電源模式選「最佳效能」。' });
+  return out;
+}
+async function runPreflight() {
+  const box = document.getElementById('preflight'), list = document.getElementById('preflightList');
+  if (!box || !list) return [];
+  await readPowerState();
+  const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const checks = preflightChecks({ threads: wasmThreadCount(), hc: navigator.hardwareConcurrency || 1, power: _powerState, isIOS });
+  list.replaceChildren(...checks.map((c) => { const li = document.createElement('li'); li.dataset.check = c.key; li.textContent = c.text; return li; }));
+  box.classList.toggle('show', checks.length > 0);
+  box.dataset.state = checks.length ? 'shown' : 'hidden';
+  return checks;
+}
+document.getElementById('btnPreflightOk')?.addEventListener('click', () => {
+  const box = document.getElementById('preflight'); box.classList.remove('show'); box.dataset.state = 'hidden';
+});
+
+// ── 轉檔中常駐提醒＋背景分頁提醒
+function setRunNotes(on) {
+  const k = document.getElementById('keepAwakeNote'), b = document.getElementById('bgWarn');
+  if (k) {
+    k.textContent = '🔌 請接上電源・不要切換分頁或關螢幕' + ('wakeLock' in navigator ? '（已讓螢幕保持亮著）' : '（這個瀏覽器無法自動保持螢幕亮著，請調整電源設定）');
+    k.classList.toggle('show', !!on); k.dataset.state = on ? 'shown' : 'hidden';
+  }
+  if (b && !on) { b.classList.remove('show'); b.dataset.state = 'hidden'; }
+  _hiddenAt = 0;
+}
+let _hiddenAt = 0;
+const BG_WARN_MIN_MS = 3000;   // 切走不到 3 秒（例如看一下通知）不提醒
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    if (_selfTest.running) _selfTest.invalid = true;
+    if (isRunning && !_pauseResolve) _hiddenAt = Date.now();
+    return;
+  }
+  if (!_hiddenAt) return;
+  const away = Date.now() - _hiddenAt; _hiddenAt = 0;
+  if (!isRunning || away < BG_WARN_MIN_MS) return;
+  const b = document.getElementById('bgWarn');
+  const msg = '剛才切到別的頁面，這段時間速度會明顯變慢。請盡量留在這個頁面。';
+  if (b) { b.textContent = '⚠ ' + msg; b.classList.add('show'); b.dataset.state = 'shown'; clearTimeout(b._t); b._t = setTimeout(() => { b.classList.remove('show'); b.dataset.state = 'hidden'; }, 30000); }
+  log(`⚠ ${msg}（離開約 ${fmtSecs(away / 1000)}）`, 'warn');
+});
+
+// ── 一鍵自測
+const SELFTEST_KEY = 'whisper-selftest', SELFTEST_PROMPT_KEY = 'whisper-selftest-prompt';
+const SELFTEST_MODEL = 'Xenova/whisper-base';
+const _selfTest = { running: false, invalid: false };
+/** 純函式：燈號（rtf＝處理時間÷音訊長度） */
+function selfTestLight(rtf) { return rtf <= 0.8 ? 'green' : rtf <= 1.0 ? 'yellow' : 'red'; }
+/** 純函式：要測哪一段（秒）：錄音夠長就取第 2 分鐘起的 60 秒，避開片頭；太短就整段 */
+function selfTestSlice(durSec) {
+  if (durSec >= 120) return { from: 60, len: 60 };
+  if (durSec >= 70) return { from: durSec - 60, len: 60 };
+  return { from: 0, len: Math.min(60, durSec) };
+}
+/** 純函式：結果卡內容 */
+function selfTestReport(r) {
+  const light = selfTestLight(r.rtf);
+  const title = { green: '🟢 這台電腦夠快', yellow: '🟡 勉強來得及', red: '🔴 會比上課時間還久' }[light];
+  const lo = Math.max(1, Math.round(50 * r.rtf)), hi = Math.max(lo + 2, Math.round(50 * r.rtf * 1.3));
+  const summary = `50 分鐘的課約需 ${lo}–${hi} 分鐘（目前 ${(1 / r.rtf).toFixed(1)} 倍速，${r.backend === 'webgpu' ? '用顯示卡' : '用 CPU'}）`;
+  const causes = [];
+  if (!r.isolated || (r.threads <= 1 && r.hc > 1)) causes.push({ key: 'no-isolation', text: r.isSafari
+    ? '⚠ 只用到 1 條運算線路：Safari 只能用單線路，建議改用 Chrome 或 Edge。'
+    : '⚠ 只用到 1 條運算線路，這是變慢最常見的原因。請關掉這個分頁重新開一次；仍不行請改用 Chrome 或 Edge。' });
+  if (r.power === '未插電') causes.push({ key: 'on-battery', text: '⚠ 沒有接電源，電腦可能自動降速。請接上電源，Windows 電源模式選「最佳效能」。' });
+  if (r.gpu === 'failed') causes.push({ key: 'gpu-failed', text: '顯示卡加速無法使用，已自動用一般模式（CPU），不需處理。' });
+  else if (r.gpu === 'slower' || r.gpu === 'integrated') causes.push({ key: 'gpu-slower', text: r.gpu === 'integrated'
+    ? '這台電腦是內建顯示卡，用 CPU 比較快，已自動改用，不需處理。'
+    : `顯示卡比 CPU 慢${r.gpuRate ? `（約 ${(1 / r.gpuRate).toFixed(1)} 倍速）` : ''}，已自動用一般模式（CPU），不需處理。` });
+  if (light === 'yellow' && causes.length === 0) causes.push({ key: 'tip', text: '可以晚上開著電腦放著跑（請接電源）。' });
+  if (light === 'red' && causes.length === 0) causes.push({ key: 'tip', text: '這台電腦本身較慢：請關掉其他程式、接上電源後再測一次；長的課可以晚上放著跑。' });
+  return { light, title, summary, causes: causes.slice(0, 3) };
+}
+function selfTestCopyText(r) {
+  const E = envLines();
+  return [`[Whisper 自測] ${R10D_VERSION} ${stamp()}`,
+    `rtf=${r.rtf.toFixed(2)} 倍速=${(1 / r.rtf).toFixed(2)} 燈=${{ green: '綠', yellow: '黃', red: '紅' }[selfTestLight(r.rtf)]} 音訊=${Math.round(r.audioSec)}s 處理=${(r.ms / 1000).toFixed(1)}s`,
+    `isolated=${!!r.isolated} threads=${r.threads} hc=${r.hc} deviceMemory=${navigator.deviceMemory || '?'} 電源=${r.power}`,
+    `backend=${r.backend === 'webgpu' ? 'webgpu' : 'wasm-' + (r.dtype || '?')} ${E.gpu} gpu比較=${r.gpuRate ? (r.cpuRate / r.gpuRate).toFixed(2) + (r.gpuRate > r.cpuRate ? '(較慢)' : '(較快)') : r.gpu} 載入=${(r.loadMs / 1000).toFixed(1)}s encoder=${(r.encMs / 1000).toFixed(1)}s decoder=${(r.decMs / 1000).toFixed(1)}s js=${(r.otherMs / 1000).toFixed(1)}s 重試=${r.retries}`,
+    E.ua].join('\n');
+}
+let _selfTestLast = null;
+function setSelfTestBtn(state, text) {
+  const b = document.getElementById('btnSelfTest'); if (!b) return;
+  b.dataset.state = state;
+  b.disabled = state === 'running' || state === 'downloading' || state === 'disabled-offline';
+  b.textContent = text || (state === 'idle' ? '🩺 測試這台電腦（約 30 秒）' : state === 'disabled-offline' ? '🩺 測試這台電腦（需要網路）' : b.textContent);
+}
+function showSelfTestResult(r) {
+  const card = document.getElementById('selfTestResult'); if (!card) return;
+  const rep = selfTestReport(r);
+  card.dataset.state = rep.light;
+  document.getElementById('selfTestTitle').textContent = rep.title;
+  document.getElementById('selfTestSummary').textContent = rep.summary;
+  document.getElementById('selfTestCauses').replaceChildren(...rep.causes.map((c) => { const li = document.createElement('li'); li.dataset.cause = c.key; li.textContent = c.text; return li; }));
+  card.classList.add('show');
+}
+function showSelfTestInvalid() {
+  const card = document.getElementById('selfTestResult'); if (!card) return;
+  card.dataset.state = 'invalid-bg';
+  document.getElementById('selfTestTitle').textContent = '⚠ 測試時切到別的頁面，結果不準，請再測一次';
+  document.getElementById('selfTestSummary').textContent = '測試中請留在這個頁面。';
+  document.getElementById('selfTestCauses').replaceChildren();
+  card.classList.add('show');
+}
+async function refreshSelfTestAvailability() {
+  if (_selfTest.running) return;
+  const hint = document.getElementById('selfTestHint');
+  if (navigator.onLine === false && !(await whisperModelAvailableOffline(SELFTEST_MODEL).catch(() => false))) {
+    setSelfTestBtn('disabled-offline');
+    if (hint) hint.textContent = '目前沒有網路，請先連網下載一次 base 模型（約 145 MB）';
+  } else {
+    setSelfTestBtn('idle');
+    if (hint && /沒有網路/.test(hint.textContent)) hint.textContent = '';
+  }
+}
+function maybeShowSelfTestPrompt() {
+  const pr = document.getElementById('selfTestPrompt'); if (!pr) return;
+  let seen = false; try { seen = !!localStorage.getItem(SELFTEST_KEY) || localStorage.getItem(SELFTEST_PROMPT_KEY) === 'dismissed'; } catch (_) {}
+  const show = !seen && !isRunning && batchQueue.some((x) => x.status === 'pending');
+  pr.classList.toggle('show', show); pr.dataset.state = show ? 'shown' : 'dismissed';
+}
+async function runSelfTest() {
+  if (_selfTest.running || isRunning) return;
+  const hint = document.getElementById('selfTestHint');
+  const item = batchQueue.find((x) => x.status === 'pending') || batchQueue[0];
+  const file = item ? item.file : null;
+  if (!file) { flashHint(hint, '請先在下方選一個錄音檔，會拿其中 1 分鐘來測（不會存任何資料）。'); return; }
+  try { localStorage.setItem(SELFTEST_PROMPT_KEY, 'dismissed'); } catch (_) {}
+  maybeShowSelfTestPrompt();
+  _selfTest.running = true; _selfTest.invalid = false;
+  isRunning = true; isCancelled = false;
+  setModelButtonsDisabled(true); startBtn.disabled = true;
+  document.getElementById('selfTestResult')?.classList.remove('show');
+  const t0 = performance.now();
+  const tick = setInterval(() => { if (document.getElementById('btnSelfTest').dataset.state === 'running') setSelfTestBtn('running', `測試中… ${Math.round((performance.now() - t0) / 1000)} 秒`); }, 1000);
+  setSelfTestBtn('running', '測試中… 0 秒');
+  if (hint) hint.textContent = '請留在這個頁面，不要切換分頁';
+  let w = null;
+  try {
+    await readPowerState();
+    await probeGpuKind();
+    const mono = await decodeToMono16k(file);
+    const dur = mono.length / SR;
+    if (dur < 10) { flashHint(hint, '這個錄音太短（不到 10 秒），請換一個較長的檔案再測。'); return; }
+    const sl = selfTestSlice(dur);
+    const clip = mono.subarray(Math.floor(sl.from * SR), Math.floor((sl.from + sl.len) * SR));
+    const language = document.getElementById('language')?.value || undefined;
+    let threads = null;
+    const onMsg = (e) => {
+      const t = e.data?.type, x = e.data?.payload || {};
+      if (t === 'LIB_VERSION' && typeof x.threads === 'number') threads = x.threads;
+      if (t === 'BACKEND') applyBackendInfo(x);
+      if (t === 'PROGRESS' && x.status === 'downloading' && x.total) setSelfTestBtn('downloading', `下載模型 ${Math.round(x.loaded / x.total * 100)}%（只需一次）`);
+      if (t === 'PROGRESS' && x.status !== 'downloading' && document.getElementById('btnSelfTest').dataset.state === 'downloading') setSelfTestBtn('running', '測試中…');
+    };
+    const runOn = async (gpu, data, segBase, timeoutMs, pieceSec = 30) => {
+      w = createWorker(); workerReady = false; loadedModel = null;
+      w.addEventListener('message', onMsg);
+      const dtype = await chooseDtype(SELFTEST_MODEL);
+      const tl = performance.now();
+      w = await loadModelOnWorker(w, SELFTEST_MODEL, dtype, { preferGpu: gpu, afterGpuFail: !gpu }, onMsg);
+      const loadMs = performance.now() - tl;
+      const backend = _lastBackend;
+      setSelfTestBtn('running');
+      const acc = { ms: 0, audioSec: 0, encMs: 0, decMs: 0, otherMs: 0, retries: 0, loadMs, backend, dtype, segs: [] };
+      for (let k = 0, off = 0; off < data.length - SR; k++, off += pieceSec * SR) {
+        const piece = data.slice(off, Math.min(data.length, off + pieceSec * SR));
+        const res = await runChunkOnWorker(w, { language, task: 'transcribe', promptText: '', promptMaxTokens: 0, segIdx: segBase + k, startSec: off / SR }, piece, timeoutMs);
+        if (!res.ok) throw new Error(res.error || 'selftest chunk failed');
+        const st = res.evt?.payload?.stats || {};
+        const a = st.audioSec || piece.length / SR, ms = st.ms || 0;
+        acc.segs.push({ audioSec: a, ms });
+        acc.ms += ms; acc.audioSec += a; acc.encMs += st.encMs || 0; acc.decMs += st.decMs || 0;
+        acc.otherMs += Math.max(0, ms - (st.encMs || 0) - (st.decMs || 0));
+        if (st.retried || st.mode === 'seek-retry') acc.retries++;
+      }
+      return acc;
+    };
+    // 1) CPU（一般模式）：實際辨識會用的設定
+    const cpu = await runOn(false, clip, 0, 120000);
+    if (_selfTest.invalid) { showSelfTestInvalid(); return; }
+    const cpuRate = cpu.ms / 1000 / cpu.audioSec;
+    // 2) 顯示卡（獨立或判斷不出的才比；內建顯示卡已知較慢，不浪費時間）：15 秒暖機＋15 秒量測
+    let gpu = isWebGPUSupported() && _gpuKind !== 'none' && !_gpuFailedModels.has(SELFTEST_MODEL) ? (_gpuKind === 'integrated' ? 'integrated' : 'pending') : 'none';
+    let gpuRate = null, gpuAcc = null;
+    if (gpu === 'pending') {
+      try {
+        const g = await runOn(true, clip.subarray(0, Math.min(clip.length, 30 * SR)), 10, 90000, 15);
+        if (g.backend !== 'webgpu') gpu = 'failed';
+        else {
+          const last = g.segs[g.segs.length - 1];   // 第 1 段是暖機
+          gpuRate = last && last.audioSec > 0 ? last.ms / 1000 / last.audioSec : null;
+          gpu = gpuRate != null && gpuRate < cpuRate ? 'faster' : 'slower';
+          gpuAcc = g;
+          writeBackendPick(SELFTEST_MODEL, { pick: gpu === 'faster' ? 'webgpu' : 'wasm', gpuRate, cpuRate, by: 'selftest' });
+        }
+      } catch (e) { if (e?.message === 'CANCELLED') throw e; gpu = 'failed'; }
+      if (_selfTest.invalid) { showSelfTestInvalid(); return; }
+    }
+    const useGpu = gpu === 'faster';
+    const best = useGpu ? { ...gpuAcc, ms: gpuRate * cpu.audioSec * 1000, audioSec: cpu.audioSec } : cpu;
+    const r = {
+      rtf: useGpu ? gpuRate : cpuRate, cpuRate, gpuRate, gpu, backend: useGpu ? 'webgpu' : 'wasm', dtype: cpu.dtype,
+      audioSec: best.audioSec, ms: best.ms, loadMs: cpu.loadMs, encMs: best.encMs, decMs: best.decMs, otherMs: best.otherMs, retries: cpu.retries,
+      isolated: !!self.crossOriginIsolated, threads: threads || wasmThreadCount(), hc: navigator.hardwareConcurrency || 1, power: _powerState,
+      isSafari: /Safari\//.test(navigator.userAgent) && !/Chrome|Chromium|Edg\//.test(navigator.userAgent),
+    };
+    _selfTestLast = r;
+    try { localStorage.setItem(SELFTEST_KEY, JSON.stringify({ at: Date.now(), rtf: r.rtf, cpuRate, gpuRate, gpu, threads: r.threads, isolated: r.isolated, light: selfTestLight(r.rtf) })); } catch (_) {}
+    showSelfTestResult(r);
+    if (hint) hint.textContent = '';
+  } catch (e) {
+    if (e?.message !== 'CANCELLED') flashHint(hint, '測試沒有完成：' + (e?.message || e) + '。可以直接開始辨識，或稍後再測一次。');
+  } finally {
+    clearInterval(tick);
+    try { inferenceWorker?.terminate(); } catch (_) {}
+    inferenceWorker = null; workerReady = false; loadedModel = null;   // 下次開始會重新載入（依挑好的 CPU／顯示卡）
+    _selfTest.running = false; isRunning = false;
+    setModelButtonsDisabled(false);
+    startBtn.disabled = batchQueue.filter((i) => i.status === 'pending').length === 0;
+    await refreshSelfTestAvailability();
+  }
+}
+document.getElementById('btnSelfTest')?.addEventListener('click', runSelfTest);
+document.getElementById('btnSelfTestGo')?.addEventListener('click', runSelfTest);
+document.getElementById('btnSelfTestAgain')?.addEventListener('click', runSelfTest);
+document.getElementById('btnSelfTestLater')?.addEventListener('click', () => {
+  try { localStorage.setItem(SELFTEST_PROMPT_KEY, 'dismissed'); } catch (_) {}
+  maybeShowSelfTestPrompt();
+});
+document.getElementById('btnCopySelfTest')?.addEventListener('click', async () => {
+  if (!_selfTestLast) return;
+  const ok = await copyText(selfTestCopyText(_selfTestLast));
+  flashHint(document.getElementById('selfTestHint'), ok ? '已複製，貼回對話即可' : '複製失敗，請手動截圖結果');
+});
+window.addEventListener('online', refreshSelfTestAvailability);
+window.addEventListener('offline', refreshSelfTestAvailability);
+refreshSelfTestAvailability();
+probeGpuKind();
+
+// ── 運算線路（取代 localStorage 隱藏覆寫）
+(function initAdvThreads() {
+  const sel = document.getElementById('advThreads'); if (!sel) return;
+  const prev = self.__whisperThreadsOverride; self.__whisperThreadsOverride = null;
+  const auto = wasmThreadCount(); self.__whisperThreadsOverride = prev;
+  const opts = [['auto', `自動（${auto} 條，建議）`], ...[1, 2, 3, 4, 6, 8].map((n) => [String(n), `${n} 條`])];
+  sel.replaceChildren(...opts.map(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; return o; }));
+  const cur = Number(self.__whisperThreadsOverride) || 0;
+  sel.value = cur >= 1 && [1, 2, 3, 4, 6, 8].includes(cur) ? String(cur) : 'auto';
+  sel.dataset.state = sel.value;
+  if (!self.crossOriginIsolated) { sel.disabled = true; sel.title = '這個頁面目前只能用 1 條（未隔離），重新開啟分頁後再調整'; }
+  sel.addEventListener('change', () => {
+    const v = sel.value;
+    try { if (v === 'auto') localStorage.removeItem('whisper-threads'); else localStorage.setItem('whisper-threads', v); } catch (_) {}
+    self.__whisperThreadsOverride = v === 'auto' ? null : Number(v);
+    sel.dataset.state = v;
+    if (!isRunning) { workerReady = false; loadedModel = null; }   // 下次開始重建 Worker 才生效
+  });
+})();
+
 startBtn.addEventListener('click', async () => {
   if (isRunning) return; // 防止快速連點/重複觸發在 await acquireWakeLock() 期間重入，
                           // 導致同一批次被兩個併行迴圈同時處理（worker 互踩、記憶體監控計時器洩漏）
@@ -6534,6 +6987,9 @@ startBtn.addEventListener('click', async () => {
   logBox.innerHTML = '';
   logBox.classList.remove('show');
   resetEta();
+  { const pd = document.getElementById('perfDetails'); if (pd) pd.style.display = 'none'; }
+  runPreflight();          // r10d：開工前檢查（只提醒、不擋）
+  setRunNotes(true);
 
   let doneCount = 0, errorCount = 0, cancelledCount = 0;
 
@@ -6675,6 +7131,7 @@ startBtn.addEventListener('click', async () => {
     cancelBtn.classList.remove('show');
     pauseRequested = false;
     setPauseUi('hide');
+    setRunNotes(false);
     document.getElementById('spinner').classList.remove('show');
     document.getElementById('btnTxt').textContent = '▶ 開始辨識';
     setProgress(isCancelled ? 0 : 100, isCancelled ? '已取消' : '完成！', false);
@@ -7649,7 +8106,7 @@ async function applyFuzzyMedicalDict(subs, dict, threshold = FUZZY_THRESHOLD_DEF
 // 重複詞組改由轉錄當下的鬼打牆偵測負責（舊的「同一行 2–4 字片段出現 2 次」會把老師的重述大量誤判，已拿掉）。
 // 留下三項＋常見套話：① 前後都長時間沒字、孤零零冒出的一句短字幕（或常見套話）② 字速異常 ③ 只有括號的聲音描述。
 const HALLU_PHRASE_RE = /(謝謝(大家)?(收看|觀看)|請不吝|點贊|點讚|訂閱|字幕(由|製作|by)|Amara|明鏡與點點|中文字幕)/i;
-const HALLU_ISOLATED_MAX = 6;   // 覆核 S1：孤立句只標極短的（≤6 字），停頓後正常開講的句子不標
+const HALLU_ISOLATED_MAX = 4;   // 覆核 S1＋r10c 上線後覆核 S-B：孤立句只標極短的（≤4 字，如「嗯」「好」；「好，有沒有問題？」不標），停頓後正常開講的句子不標
 /** 說話量單位：中日韓文字一字＝1、英文單字或數字（連續）＝1，標點與空白不算 */
 function speechUnits(text) {
   const t = String(text ?? '');
